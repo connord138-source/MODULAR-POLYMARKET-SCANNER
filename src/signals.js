@@ -1,6 +1,10 @@
 // ============================================================
 // SIGNALS.JS - Signal Detection and Scoring
-// v18.4.8 - Fix wallet extraction, add lower scoring tiers
+// v18.5.0 - Port key features from monolithic version:
+//   - Fresh wallet detection via activity API
+//   - Filter extreme odds (sure bets)
+//   - Proper wallet extraction (proxyWallet)
+//   - Gambling market filtering
 // ============================================================
 
 import { POLYMARKET_API, SCORES, KV_KEYS } from './config.js';
@@ -8,14 +12,57 @@ import { detectMarketType, hasEventStarted, generateId, isSportsGame, classifyMa
 import { trackWalletBet } from './wallets.js';
 import { calculateConfidence } from './learning.js';
 
-// Helper to check if an outcome is a "NO" type bet
+// ============================================================
+// GAMBLING MARKET FILTER
+// Short-term gambling markets (crypto up/down, etc.) are noise
+// ============================================================
+const GAMBLING_KEYWORDS = [
+  'up or down',
+  'bitcoin up or down',
+  'ethereum up or down', 
+  'solana up or down',
+  'xrp up or down',
+  'btc up or down',
+  'eth up or down',
+  'sol up or down',
+  '15m', '30m', '1h', '5m',  // Time-based gambling
+  'next 15 minutes',
+  'next 30 minutes',
+  'next hour'
+];
+
+function isGamblingMarket(title) {
+  if (!title) return false;
+  const lower = title.toLowerCase();
+  return GAMBLING_KEYWORDS.some(kw => lower.includes(kw));
+}
+
+// ============================================================
+// WALLET HELPERS
+// ============================================================
+
+// Extract wallet address from trade object
+function extractWallet(trade) {
+  // Polymarket uses 'proxyWallet' field (discovered from API)
+  const wallet = trade.proxyWallet || 
+                 trade.user || 
+                 trade.maker ||
+                 trade.taker;
+  
+  if (wallet && typeof wallet === 'string' && wallet.length > 10) {
+    return wallet;
+  }
+  return null;
+}
+
+// Check if an outcome is a "NO" type bet
 function isNoBetOutcome(outcome) {
   if (!outcome) return false;
   const lower = String(outcome).toLowerCase();
   return lower === 'no' || lower === 'false' || lower === '0';
 }
 
-// Helper to normalize price to implied YES price
+// Normalize price to implied YES price
 function normalizeToYesPrice(rawPrice, outcome) {
   const price = parseFloat(rawPrice || 0);
   if (isNoBetOutcome(outcome)) {
@@ -24,40 +71,55 @@ function normalizeToYesPrice(rawPrice, outcome) {
   return price;
 }
 
-// Extract wallet address from trade object
-function extractWallet(trade) {
-  // Polymarket API uses different fields for wallet addresses
-  // Try multiple possible fields
-  const wallet = trade.maker || 
-                 trade.taker || 
-                 trade.user || 
-                 trade.owner ||
-                 trade.trader ||
-                 trade.account ||
-                 trade.address ||
-                 trade.wallet;
+// ============================================================
+// WALLET ACTIVITY FETCHING
+// This is what made the old version powerful - detecting fresh wallets
+// ============================================================
+
+async function fetchWalletProfiles(wallets) {
+  const profiles = {};
   
-  // Validate it looks like an address
-  if (wallet && typeof wallet === 'string' && wallet.length > 10) {
-    return wallet;
+  // Process in batches of 10 to avoid rate limits
+  for (let i = 0; i < wallets.length; i += 10) {
+    const batch = wallets.slice(i, i + 10);
+    
+    await Promise.all(batch.map(async (wallet) => {
+      if (!wallet) return;
+      
+      try {
+        const res = await fetch(`${POLYMARKET_API}/activity?user=${wallet}&limit=20`);
+        if (res.ok) {
+          const activity = await res.json();
+          const totalTrades = activity?.length || 0;
+          profiles[wallet] = {
+            totalTrades,
+            isFresh: totalTrades < 10,
+            isVeryFresh: totalTrades < 3
+          };
+        } else {
+          // If we can't fetch, assume fresh (conservative)
+          profiles[wallet] = { totalTrades: 0, isFresh: true, isVeryFresh: true };
+        }
+      } catch (e) {
+        profiles[wallet] = { totalTrades: 0, isFresh: true, isVeryFresh: true };
+      }
+    }));
   }
   
-  // Check nested objects
-  if (trade.makerOrder?.maker) return trade.makerOrder.maker;
-  if (trade.takerOrder?.taker) return trade.takerOrder.taker;
-  
-  return null;
+  return profiles;
 }
 
-// Main scan function
+// ============================================================
+// MAIN SCAN FUNCTION
+// ============================================================
+
 export async function runScan(hours, minScore, env, options = {}) {
   const startTime = Date.now();
   const { sportsOnly = false, includeDebug = false, includeStored = true } = options;
   
   try {
-    // Polymarket API caps at certain limits - try to get as many as possible
+    // Fetch trades from API
     const TRADE_LIMIT = 5000;
-    
     const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=${TRADE_LIMIT}`);
     if (!tradesRes.ok) {
       throw new Error(`Trades API error: ${tradesRes.status}`);
@@ -65,143 +127,330 @@ export async function runScan(hours, minScore, env, options = {}) {
     
     const allTrades = await tradesRes.json();
     const cutoffTime = Date.now() - (hours * 60 * 60 * 1000);
-    const recentTrades = allTrades.filter(t => t.timestamp * 1000 > cutoffTime);
     
-    // Debug: Track API response
+    // Debug stats
+    const debugCounts = {
+      total: allTrades.length,
+      tooOld: 0,
+      settlement: 0,
+      sureBet: 0,
+      tooSmall: 0,
+      gamblingMarket: 0,
+      passed: 0
+    };
+    
+    // API stats for debugging
     const apiStats = {
       requestedLimit: TRADE_LIMIT,
       totalFromApi: allTrades.length,
-      withinTimeWindow: recentTrades.length,
       oldestTradeTime: allTrades.length > 0 ? new Date(allTrades[allTrades.length - 1].timestamp * 1000).toISOString() : null,
       newestTradeTime: allTrades.length > 0 ? new Date(allTrades[0].timestamp * 1000).toISOString() : null,
-      cutoffTime: new Date(cutoffTime).toISOString(),
-      // Sample a trade to see its structure
-      sampleTradeFields: allTrades.length > 0 ? Object.keys(allTrades[0]) : []
+      cutoffTime: new Date(cutoffTime).toISOString()
     };
     
-    // Group by market
-    const marketGroups = {};
-    let skippedFutures = 0;
-    let skippedNonSports = 0;
-    let totalVolumeTracked = 0;
-    let walletsFound = 0;
-    let walletsNull = 0;
+    // ============================================================
+    // FILTER TRADES (matching old monolithic logic)
+    // ============================================================
+    const validTrades = [];
     
-    for (const trade of recentTrades) {
-      const marketKey = trade.eventSlug || trade.slug || trade.market;
-      if (!marketKey) continue;
+    for (const t of allTrades) {
+      const marketTitle = t.title || t.market || '';
       
-      const title = trade.eventTitle || trade.title || marketKey;
-      const tradeSize = parseFloat(trade.size || 0);
-      const wallet = extractWallet(trade);
-      
-      if (wallet) {
-        walletsFound++;
-      } else {
-        walletsNull++;
+      // Filter gambling markets
+      if (isGamblingMarket(marketTitle)) {
+        debugCounts.gamblingMarket++;
+        continue;
       }
       
-      // If sportsOnly mode, filter out non-game markets
-      if (sportsOnly) {
-        const classification = classifyMarket(title, marketKey);
-        
-        if (!classification.isGame) {
-          if (classification.marketType === 'futures') {
-            skippedFutures++;
-          } else {
-            skippedNonSports++;
-          }
-          continue;
-        }
+      // Filter by time
+      let tradeTime = t.timestamp;
+      if (tradeTime && tradeTime < 1e10) {
+        tradeTime = tradeTime * 1000; // Convert seconds to ms
+      }
+      if (!tradeTime || tradeTime < cutoffTime) {
+        debugCounts.tooOld++;
+        continue;
       }
       
-      if (!marketGroups[marketKey]) {
-        marketGroups[marketKey] = {
-          slug: marketKey,
-          title: title,
+      const price = parseFloat(t.price) || 0;
+      
+      // Filter settlement-level prices (basically resolved)
+      if (price >= 0.99 || price <= 0.01) {
+        debugCounts.settlement++;
+        continue;
+      }
+      
+      // Filter "sure bet" trades - odds too extreme to be meaningful
+      // Betting at 85%+ is almost guaranteed to win - not real alpha
+      if (price >= 0.85 || price <= 0.15) {
+        debugCounts.sureBet++;
+        continue;
+      }
+      
+      // Calculate USD value
+      let usdValue = parseFloat(t.usd_value) || 0;
+      if (!usdValue && t.size && t.price) {
+        usdValue = parseFloat(t.size) * parseFloat(t.price);
+      }
+      if (!usdValue && t.size) {
+        usdValue = parseFloat(t.size);
+      }
+      
+      // Filter tiny trades
+      if (usdValue < 10) {
+        debugCounts.tooSmall++;
+        continue;
+      }
+      
+      // Attach computed values
+      t._tradeTime = tradeTime;
+      t._usdValue = usdValue;
+      
+      debugCounts.passed++;
+      validTrades.push(t);
+    }
+    
+    apiStats.validTrades = validTrades.length;
+    apiStats.filterStats = debugCounts;
+    
+    // If sportsOnly, filter further
+    if (sportsOnly) {
+      const sportsTrades = validTrades.filter(t => {
+        const title = t.title || t.eventTitle || '';
+        const slug = t.slug || t.eventSlug || '';
+        const classification = classifyMarket(title, slug);
+        return classification.isGame;
+      });
+      validTrades.length = 0;
+      validTrades.push(...sportsTrades);
+    }
+    
+    // ============================================================
+    // FETCH WALLET PROFILES (fresh wallet detection)
+    // ============================================================
+    const uniqueWallets = [...new Set(validTrades.map(t => extractWallet(t)).filter(Boolean))].slice(0, 100);
+    console.log(`Fetching profiles for ${uniqueWallets.length} unique wallets...`);
+    
+    const walletProfiles = await fetchWalletProfiles(uniqueWallets);
+    
+    const freshWalletCount = Object.values(walletProfiles).filter(p => p.isFresh).length;
+    apiStats.uniqueWallets = uniqueWallets.length;
+    apiStats.freshWallets = freshWalletCount;
+    
+    // ============================================================
+    // GROUP TRADES BY MARKET + DIRECTION
+    // ============================================================
+    const groups = {};
+    
+    for (const t of validTrades) {
+      const marketKey = t.slug || t.eventSlug || t.conditionId;
+      const direction = t.outcome || (t.side === "BUY" ? "Yes" : "No");
+      const key = `${marketKey}:${direction}`;
+      
+      if (!groups[key]) {
+        groups[key] = {
+          marketKey,
+          marketTitle: t.title || t.eventTitle || "Unknown Market",
+          marketSlug: t.slug || t.eventSlug,
+          marketIcon: t.icon,
+          direction,
           trades: [],
+          wallets: new Set(),
           totalVolume: 0,
-          wallets: new Set()
+          largestBet: 0,
+          timestamps: []
         };
       }
       
-      marketGroups[marketKey].trades.push(trade);
-      marketGroups[marketKey].totalVolume += tradeSize;
-      if (wallet) {
-        marketGroups[marketKey].wallets.add(wallet);
-      }
-      totalVolumeTracked += tradeSize;
+      const wallet = extractWallet(t);
+      groups[key].trades.push(t);
+      if (wallet) groups[key].wallets.add(wallet);
+      groups[key].totalVolume += t._usdValue;
+      groups[key].largestBet = Math.max(groups[key].largestBet, t._usdValue);
+      groups[key].timestamps.push(t._tradeTime);
     }
     
-    apiStats.walletsFound = walletsFound;
-    apiStats.walletsNull = walletsNull;
-    
-    // Analyze each market
+    // ============================================================
+    // SCORE EACH GROUP AND CREATE SIGNALS
+    // ============================================================
     const newSignals = [];
     const debugInfo = [];
-    const seenMarkets = new Set();
-    const skippedReasons = {};
     
-    for (const [slug, market] of Object.entries(marketGroups)) {
-      const analysis = analyzeMarket(market);
-      const classification = classifyMarket(market.title, slug);
-      const marketType = detectMarketType(market.title, slug);
+    for (const [key, g] of Object.entries(groups)) {
+      // Skip gambling markets (double check)
+      if (isGamblingMarket(g.marketTitle)) continue;
       
-      seenMarkets.add(slug);
+      let score = 0;
+      const factors = [];
+      const numWallets = g.wallets.size || 1;
       
-      // Track why markets were skipped
-      if (analysis.score < minScore) {
-        const bucket = Math.floor(analysis.score / 10) * 10;
-        const reason = `score_${bucket}-${bucket + 9}`;
-        skippedReasons[reason] = (skippedReasons[reason] || 0) + 1;
+      // Calculate wallet metrics
+      const walletVolumes = {};
+      let largestFreshWalletBet = 0;
+      let freshWalletVolume = 0;
+      
+      for (const t of g.trades) {
+        const wallet = extractWallet(t);
+        if (wallet) {
+          walletVolumes[wallet] = (walletVolumes[wallet] || 0) + t._usdValue;
+          
+          const profile = walletProfiles[wallet];
+          if (profile?.isFresh) {
+            freshWalletVolume += t._usdValue;
+            largestFreshWalletBet = Math.max(largestFreshWalletBet, t._usdValue);
+          }
+        }
       }
+      
+      // Sort wallets by volume
+      const sortedWalletVolumes = Object.values(walletVolumes).sort((a, b) => b - a);
+      const topWalletVolume = sortedWalletVolumes[0] || 0;
+      const topWalletPct = g.totalVolume > 0 ? topWalletVolume / g.totalVolume : 0;
+      
+      // Check if largest bet is from a fresh wallet
+      const isLargestBetFresh = largestFreshWalletBet >= g.largestBet * 0.95;
+      
+      // ========== SCORING: FRESH WALLET OR WHALE BET ==========
+      // Fresh wallet bets are MORE suspicious than regular whale bets
+      if (isLargestBetFresh && largestFreshWalletBet >= 50000) {
+        score += SCORES.FRESH_WHALE_HUGE;
+        factors.push({ name: 'freshWhale50k', score: SCORES.FRESH_WHALE_HUGE, detail: `🚨 Fresh wallet $${Math.round(largestFreshWalletBet/1000)}k` });
+      } else if (isLargestBetFresh && largestFreshWalletBet >= 25000) {
+        score += SCORES.FRESH_WHALE_LARGE;
+        factors.push({ name: 'freshWhale25k', score: SCORES.FRESH_WHALE_LARGE, detail: `🚨 Fresh wallet $${Math.round(largestFreshWalletBet/1000)}k` });
+      } else if (isLargestBetFresh && largestFreshWalletBet >= 10000) {
+        score += SCORES.FRESH_WHALE_NOTABLE;
+        factors.push({ name: 'freshWhale10k', score: SCORES.FRESH_WHALE_NOTABLE, detail: `⚠️ Fresh wallet $${Math.round(largestFreshWalletBet/1000)}k` });
+      } else if (isLargestBetFresh && largestFreshWalletBet >= 5000) {
+        score += SCORES.FRESH_WHALE_MEDIUM;
+        factors.push({ name: 'freshWhale5k', score: SCORES.FRESH_WHALE_MEDIUM, detail: `Fresh wallet $${Math.round(largestFreshWalletBet/1000)}k` });
+      } else if (isLargestBetFresh && largestFreshWalletBet >= 2000) {
+        score += SCORES.FRESH_WALLET_SMALL;
+        factors.push({ name: 'freshWallet2k', score: SCORES.FRESH_WALLET_SMALL, detail: `Fresh wallet $${Math.round(largestFreshWalletBet/1000)}k` });
+      } else if (g.largestBet >= 50000) {
+        score += SCORES.WHALE_BET_MASSIVE;
+        factors.push({ name: 'whaleSize50k', score: SCORES.WHALE_BET_MASSIVE, detail: `$${Math.round(g.largestBet/1000)}k bet` });
+      } else if (g.largestBet >= 25000) {
+        score += SCORES.WHALE_BET_LARGE;
+        factors.push({ name: 'whaleSize25k', score: SCORES.WHALE_BET_LARGE, detail: `$${Math.round(g.largestBet/1000)}k bet` });
+      } else if (g.largestBet >= 15000) {
+        score += SCORES.WHALE_BET_NOTABLE;
+        factors.push({ name: 'whaleSize15k', score: SCORES.WHALE_BET_NOTABLE, detail: `$${Math.round(g.largestBet/1000)}k bet` });
+      } else if (g.largestBet >= 8000) {
+        score += SCORES.WHALE_BET_MEDIUM;
+        factors.push({ name: 'whaleSize8k', score: SCORES.WHALE_BET_MEDIUM, detail: `$${Math.round(g.largestBet/1000)}k bet` });
+      } else if (g.largestBet >= 3000) {
+        score += SCORES.WHALE_BET_SMALL;
+        factors.push({ name: 'whaleSize3k', score: SCORES.WHALE_BET_SMALL, detail: `$${Math.round(g.largestBet/1000)}k bet` });
+      }
+      
+      // ========== SCORING: CONCENTRATION ==========
+      if (numWallets <= 2 && topWalletPct >= 0.80 && topWalletVolume >= 10000) {
+        score += SCORES.CONCENTRATION_SINGLE_WHALE;
+        factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_SINGLE_WHALE, detail: 'Single whale dominance' });
+      } else if (numWallets === 2 && topWalletPct >= 0.50 && topWalletVolume >= 5000) {
+        score += SCORES.CONCENTRATION_WHALE_DUO;
+        factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_WHALE_DUO, detail: 'Whale duo' });
+      } else if (topWalletPct >= 0.60 && topWalletVolume >= 5000) {
+        score += SCORES.CONCENTRATION_HIGH;
+        factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_HIGH, detail: 'High concentration' });
+      }
+      
+      // ========== SCORING: VOLUME ==========
+      if (g.totalVolume >= 100000) {
+        score += SCORES.VOLUME_HUGE;
+        factors.push({ name: 'volumeHuge', score: SCORES.VOLUME_HUGE, detail: `$${Math.round(g.totalVolume/1000)}k volume` });
+      } else if (g.totalVolume >= 50000) {
+        score += SCORES.VOLUME_NOTABLE;
+        factors.push({ name: 'volumeNotable', score: SCORES.VOLUME_NOTABLE, detail: `$${Math.round(g.totalVolume/1000)}k volume` });
+      } else if (g.totalVolume >= 20000) {
+        score += SCORES.VOLUME_MODERATE;
+        factors.push({ name: 'volumeModerate', score: SCORES.VOLUME_MODERATE, detail: `$${Math.round(g.totalVolume/1000)}k volume` });
+      }
+      
+      // ========== SCORING: COORDINATED ACTION ==========
+      if (numWallets >= 3 && g.timestamps.length >= 3) {
+        const sortedTimes = [...g.timestamps].sort((a, b) => a - b);
+        const timeSpan = sortedTimes[sortedTimes.length - 1] - sortedTimes[0];
+        const avgTimeBetween = timeSpan / (sortedTimes.length - 1);
+        
+        // If 3+ wallets bet within 5 minutes with $10k+ each
+        if (timeSpan < 5 * 60 * 1000 && g.largestBet >= 10000) {
+          score += SCORES.COORDINATED_WHALES;
+          factors.push({ name: 'coordinated', score: SCORES.COORDINATED_WHALES, detail: `${numWallets} wallets in ${Math.round(timeSpan/1000)}s` });
+        } else if (timeSpan < 15 * 60 * 1000 && g.totalVolume >= 20000) {
+          score += SCORES.COORDINATED_LARGE;
+          factors.push({ name: 'coordinated', score: SCORES.COORDINATED_LARGE, detail: `Coordinated buying` });
+        }
+      }
+      
+      // Get average entry price (normalized)
+      const avgPrice = g.trades.length > 0 
+        ? g.trades.reduce((sum, t) => sum + (parseFloat(t.price) || 0), 0) / g.trades.length
+        : 0.5;
+      const displayPrice = Math.round(normalizeToYesPrice(avgPrice, g.direction) * 100);
+      
+      // Build top trades list
+      const topTrades = g.trades
+        .map(t => ({
+          wallet: extractWallet(t) || 'unknown',
+          amount: t._usdValue,
+          price: Math.round(normalizeToYesPrice(parseFloat(t.price) || 0, t.outcome || g.direction) * 100),
+          direction: t.outcome || g.direction,
+          time: new Date(t._tradeTime).toISOString(),
+          isFresh: walletProfiles[extractWallet(t)]?.isFresh || false
+        }))
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 10);
+      
+      // Classification
+      const classification = classifyMarket(g.marketTitle, g.marketSlug);
+      const marketType = detectMarketType(g.marketTitle, g.marketSlug);
       
       if (includeDebug) {
         debugInfo.push({
-          slug,
-          title: market.title,
-          score: analysis.score,
+          slug: g.marketSlug,
+          title: g.marketTitle,
+          direction: g.direction,
+          score,
+          volume: g.totalVolume,
+          largestBet: g.largestBet,
+          walletCount: numWallets,
+          freshWalletBet: largestFreshWalletBet,
           isGame: classification.isGame,
-          marketType,
-          reason: classification.reason,
-          volume: market.totalVolume,
-          largestBet: analysis.largestBet,
-          direction: analysis.direction,
-          displayPrice: analysis.avgPrice,
-          entryPrice: analysis.entryPrice,
-          walletCount: market.wallets.size,
-          tradeCount: market.trades.length,
-          isNoBet: analysis.isNoBet
+          marketType
         });
       }
       
-      if (analysis.score >= minScore) {
-        const walletArray = Array.from(market.wallets).filter(w => w !== null);
+      // Only create signal if meets threshold
+      if (score >= minScore) {
+        const walletArray = Array.from(g.wallets).filter(Boolean);
         
         const signal = {
           id: generateId(),
-          marketSlug: slug,
-          marketTitle: market.title,
-          score: analysis.score,
-          factors: analysis.factors,
-          direction: analysis.direction,
-          priceAtSignal: analysis.avgPrice,
-          entryPrice: analysis.entryPrice,
-          isNoBet: analysis.isNoBet,
-          largestBet: analysis.largestBet,
-          totalVolume: market.totalVolume,
-          walletCount: walletArray.length || market.wallets.size,
+          marketSlug: g.marketSlug,
+          marketTitle: g.marketTitle,
+          score,
+          factors,
+          direction: g.direction,
+          priceAtSignal: displayPrice,
+          entryPrice: displayPrice,
+          isNoBet: isNoBetOutcome(g.direction),
+          largestBet: g.largestBet,
+          totalVolume: g.totalVolume,
+          walletCount: walletArray.length,
           wallets: walletArray.slice(0, 10),
-          topTrades: analysis.topTrades || [],
+          topTrades,
+          freshWalletBet: largestFreshWalletBet,
           detectedAt: new Date().toISOString(),
-          marketType: marketType,
+          marketType,
           isGame: classification.isGame,
           classification: classification.reason,
           source: 'live'
         };
         
         // Calculate confidence
-        const factorNames = analysis.factors.map(f => f.name);
+        const factorNames = factors.map(f => f.name);
         const confidenceResult = await calculateConfidence(env, factorNames, signal);
         
         if (confidenceResult) {
@@ -224,8 +473,8 @@ export async function runScan(hours, minScore, env, options = {}) {
                 signalId: signal.id,
                 market: signal.marketTitle,
                 direction: signal.direction,
-                amount: analysis.largestBet,
-                price: analysis.avgPrice
+                amount: g.largestBet,
+                price: displayPrice
               });
             }
           }
@@ -233,17 +482,19 @@ export async function runScan(hours, minScore, env, options = {}) {
       }
     }
     
-    // Merge with stored signals
+    // ============================================================
+    // MERGE WITH STORED SIGNALS
+    // ============================================================
     let allSignals = [...newSignals];
-    const seenSlugs = new Set(newSignals.map(s => s.marketSlug));
+    const seenSlugs = new Set(newSignals.map(s => `${s.marketSlug}:${s.direction}`));
     
     if (includeStored && env.SIGNALS_CACHE) {
       const storedSignals = await getRecentSignals(env, 50);
       const storedCutoff = Date.now() - (hours * 60 * 60 * 1000);
       
       for (const stored of storedSignals) {
-        if (seenSlugs.has(stored.marketSlug)) continue;
-        if (seenMarkets.has(stored.marketSlug)) continue;
+        const key = `${stored.marketSlug}:${stored.direction}`;
+        if (seenSlugs.has(key)) continue;
         
         const signalTime = new Date(stored.detectedAt).getTime();
         if (signalTime >= storedCutoff) {
@@ -251,30 +502,23 @@ export async function runScan(hours, minScore, env, options = {}) {
           if (stored.score < minScore) continue;
           
           allSignals.push({ ...stored, source: 'stored' });
-          seenSlugs.add(stored.marketSlug);
+          seenSlugs.add(key);
         }
       }
     }
     
-    // Dedupe
-    const dedupedMap = new Map();
-    for (const signal of allSignals) {
-      const existing = dedupedMap.get(signal.marketSlug);
-      if (!existing || signal.score > existing.score) {
-        dedupedMap.set(signal.marketSlug, signal);
-      }
-    }
-    allSignals = Array.from(dedupedMap.values());
-    
     // Sort by score
     allSignals.sort((a, b) => b.score - a.score);
     
+    // Calculate total volume
+    const totalVolumeTracked = Object.values(groups).reduce((sum, g) => sum + g.totalVolume, 0);
+    
     const result = {
       success: true,
-      version: "18.4.8",
+      version: "18.5.0",
       scanTime: Date.now() - startTime,
-      tradesAnalyzed: recentTrades.length,
-      marketsAnalyzed: Object.keys(marketGroups).length,
+      tradesAnalyzed: validTrades.length,
+      marketsAnalyzed: Object.keys(groups).length,
       signalsFound: allSignals.length,
       newSignals: newSignals.length,
       storedSignals: allSignals.length - newSignals.length,
@@ -284,24 +528,16 @@ export async function runScan(hours, minScore, env, options = {}) {
       apiStats
     };
     
-    if (sportsOnly) {
-      result.filtered = {
-        skippedFutures,
-        skippedNonSports,
-        gamesAnalyzed: Object.keys(marketGroups).length
-      };
-    }
-    
     if (includeDebug) {
       result.debug = debugInfo
-        .sort((a, b) => b.volume - a.volume)  // Sort by volume to see biggest markets
+        .sort((a, b) => b.volume - a.volume)
         .slice(0, 100);
-      result.skippedReasons = skippedReasons;
     }
     
     return result;
     
   } catch (e) {
+    console.error("Scan error:", e);
     return {
       success: false,
       error: e.message,
@@ -310,177 +546,15 @@ export async function runScan(hours, minScore, env, options = {}) {
   }
 }
 
-// Analyze a market for signals
-function analyzeMarket(market) {
-  const { trades, totalVolume, wallets } = market;
-  
-  let score = 0;
-  const factors = [];
-  
-  let largestBet = 0;
-  let largestBetDirection = null;
-  let largestBetPrice = 0;
-  let largestBetWallet = null;
-  
-  const directionData = {};
-  const tradesList = [];
-  
-  for (const trade of trades) {
-    const rawPrice = parseFloat(trade.price || 0);
-    const size = parseFloat(trade.size || 0);
-    const direction = trade.outcome || trade.side || 'unknown';
-    const wallet = extractWallet(trade);
-    const timestamp = trade.timestamp ? new Date(trade.timestamp * 1000).toISOString() : new Date().toISOString();
-    
-    const normalizedPrice = normalizeToYesPrice(rawPrice, direction);
-    
-    if (size > largestBet) {
-      largestBet = size;
-      largestBetDirection = direction;
-      largestBetPrice = rawPrice;
-      largestBetWallet = wallet;
-    }
-    
-    if (!directionData[direction]) {
-      directionData[direction] = { volume: 0, totalPrice: 0, count: 0 };
-    }
-    directionData[direction].volume += size;
-    directionData[direction].totalPrice += rawPrice;
-    directionData[direction].count += 1;
-    
-    tradesList.push({
-      wallet: wallet || 'unknown',
-      amount: size,
-      price: Math.round(normalizedPrice * 100),
-      direction,
-      time: timestamp,
-      rawPrice: Math.round(rawPrice * 100),
-      isNo: isNoBetOutcome(direction)
-    });
-  }
-  
-  const topTrades = tradesList
-    .sort((a, b) => b.amount - a.amount)
-    .slice(0, 10);
-  
-  // Determine dominant direction
-  let dominantDirection = largestBetDirection;
-  let maxVolume = 0;
-  for (const [dir, data] of Object.entries(directionData)) {
-    if (data.volume > maxVolume) {
-      maxVolume = data.volume;
-      dominantDirection = dir;
-    }
-  }
-  
-  const dominantData = directionData[dominantDirection] || { totalPrice: 0, count: 1 };
-  const avgRawEntryPrice = dominantData.count > 0 
-    ? (dominantData.totalPrice / dominantData.count)
-    : 0.5;
-  
-  const dominantIsNoBet = isNoBetOutcome(dominantDirection);
-  const normalizedEntryPrice = normalizeToYesPrice(avgRawEntryPrice, dominantDirection);
-  const displayPrice = Math.round(normalizedEntryPrice * 100);
-  const avgEntryPrice = displayPrice;
-  
-  // Only skip if event date is clearly past
-  const dateMatch = (market.slug || '').match(/(\d{4})-(\d{2})-(\d{2})/);
-  if (dateMatch) {
-    const eventDate = new Date(dateMatch[0]);
-    const now = new Date();
-    if (eventDate < new Date(now.getTime() - 24 * 60 * 60 * 1000)) {
-      return { score: 0, factors: [], direction: dominantDirection, avgPrice: displayPrice, entryPrice: avgEntryPrice, largestBet, topTrades: [], skippedReason: 'event_past' };
-    }
-  }
-  
-  // SCORING: Whale bet size
-  if (largestBet >= 50000) {
-    score += SCORES.WHALE_BET_MASSIVE;
-    factors.push({ name: 'whaleSize50k', score: SCORES.WHALE_BET_MASSIVE, detail: `$${Math.round(largestBet/1000)}k bet` });
-  } else if (largestBet >= 25000) {
-    score += SCORES.WHALE_BET_LARGE;
-    factors.push({ name: 'whaleSize25k', score: SCORES.WHALE_BET_LARGE, detail: `$${Math.round(largestBet/1000)}k bet` });
-  } else if (largestBet >= 15000) {
-    score += SCORES.WHALE_BET_NOTABLE;
-    factors.push({ name: 'whaleSize15k', score: SCORES.WHALE_BET_NOTABLE, detail: `$${Math.round(largestBet/1000)}k bet` });
-  } else if (largestBet >= 8000) {
-    score += SCORES.WHALE_BET_MEDIUM;
-    factors.push({ name: 'whaleSize8k', score: SCORES.WHALE_BET_MEDIUM, detail: `$${Math.round(largestBet/1000)}k bet` });
-  } else if (largestBet >= 3000) {
-    score += SCORES.WHALE_BET_SMALL;
-    factors.push({ name: 'whaleSize3k', score: SCORES.WHALE_BET_SMALL, detail: `$${Math.round(largestBet/1000)}k bet` });
-  } else if (largestBet >= 1000) {
-    // NEW: Lower tier for $1k+ bets
-    score += 5;
-    factors.push({ name: 'whaleSize1k', score: 5, detail: `$${Math.round(largestBet/1000)}k bet` });
-  }
-  
-  // SCORING: Volume
-  if (totalVolume >= 100000) {
-    score += SCORES.VOLUME_HUGE;
-    factors.push({ name: 'volumeHuge', score: SCORES.VOLUME_HUGE, detail: `$${Math.round(totalVolume/1000)}k volume` });
-  } else if (totalVolume >= 50000) {
-    score += SCORES.VOLUME_NOTABLE;
-    factors.push({ name: 'volumeNotable', score: SCORES.VOLUME_NOTABLE, detail: `$${Math.round(totalVolume/1000)}k volume` });
-  } else if (totalVolume >= 20000) {
-    score += SCORES.VOLUME_MODERATE;
-    factors.push({ name: 'volumeModerate', score: SCORES.VOLUME_MODERATE, detail: `$${Math.round(totalVolume/1000)}k volume` });
-  } else if (totalVolume >= 5000) {
-    // NEW: Lower tier for moderate volume
-    score += 3;
-    factors.push({ name: 'volumeLight', score: 3, detail: `$${Math.round(totalVolume/1000)}k volume` });
-  }
-  
-  // SCORING: Extreme odds
-  if (displayPrice <= 15) {
-    score += SCORES.EXTREME_LONGSHOT;
-    factors.push({ name: 'extremeOdds', score: SCORES.EXTREME_LONGSHOT, detail: `Longshot at ${displayPrice}%` });
-  } else if (displayPrice >= 85) {
-    score += SCORES.EXTREME_HEAVY_FAVORITE;
-    factors.push({ name: 'extremeOdds', score: SCORES.EXTREME_HEAVY_FAVORITE, detail: `Heavy favorite at ${displayPrice}%` });
-  } else if (displayPrice <= 25) {
-    score += SCORES.MODERATE_LONGSHOT;
-    factors.push({ name: 'moderateLongshot', score: SCORES.MODERATE_LONGSHOT, detail: `Longshot at ${displayPrice}%` });
-  } else if (displayPrice >= 75) {
-    score += SCORES.MODERATE_FAVORITE;
-    factors.push({ name: 'moderateFavorite', score: SCORES.MODERATE_FAVORITE, detail: `Favorite at ${displayPrice}%` });
-  }
-  
-  // SCORING: Concentration
-  const walletCount = wallets.size || 1;
-  if (walletCount === 1 && largestBet >= 10000) {
-    score += SCORES.CONCENTRATION_SINGLE_WHALE;
-    factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_SINGLE_WHALE, detail: 'Single whale dominance' });
-  } else if (walletCount <= 2 && largestBet >= 5000) {
-    score += SCORES.CONCENTRATION_WHALE_DUO;
-    factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_WHALE_DUO, detail: 'Whale duo' });
-  } else if (walletCount <= 3 && largestBet >= 5000) {
-    score += SCORES.CONCENTRATION_HIGH;
-    factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_HIGH, detail: 'High concentration' });
-  } else if (walletCount === 1 && largestBet >= 1000) {
-    // NEW: Lower tier for single wallet with decent bet
-    score += 5;
-    factors.push({ name: 'singleWallet', score: 5, detail: 'Single wallet activity' });
-  }
-  
-  return {
-    score,
-    factors,
-    direction: dominantDirection,
-    avgPrice: displayPrice,
-    entryPrice: avgEntryPrice,
-    largestBet,
-    isNoBet: dominantIsNoBet,
-    topTrades
-  };
-}
+// ============================================================
+// KV STORAGE FUNCTIONS
+// ============================================================
 
-// Store signal in KV
 async function storeSignal(env, signal) {
   if (!env.SIGNALS_CACHE) return;
   
   try {
-    const marketKey = "market_" + signal.marketSlug;
+    const marketKey = "market_" + signal.marketSlug + "_" + signal.direction;
     const existingMarketSignal = await env.SIGNALS_CACHE.get(marketKey, { type: "json" });
     
     if (existingMarketSignal) {
@@ -524,7 +598,6 @@ async function storeSignal(env, signal) {
   }
 }
 
-// Get recent signals
 export async function getRecentSignals(env, limit = 20) {
   if (!env.SIGNALS_CACHE) return [];
   
@@ -546,7 +619,6 @@ export async function getRecentSignals(env, limit = 20) {
   }
 }
 
-// Get signal by ID
 export async function getSignal(env, signalId) {
   if (!env.SIGNALS_CACHE || !signalId) return null;
   
