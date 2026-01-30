@@ -1,6 +1,6 @@
 // ============================================================
 // INDEX.JS - Main Router for Polymarket Scanner
-// v18.0.0 - Modular Architecture
+// v18.5.0 - Trade Accumulation System
 // ============================================================
 
 import { corsHeaders, VERSION, SPORT_KEY_MAP, KV_KEYS } from './config.js';
@@ -9,22 +9,36 @@ import { getWalletStats, getWalletLeaderboard, getTrackedWallets } from './walle
 import { getOddsComparison, getGameScores, getGameOdds } from './odds-api.js';
 import { processSettledSignals } from './settlement.js';
 import { getFactorStats, getAIRecommendation, updateFactorStats, getDiscoveredPatterns } from './learning.js';
+import { pollAndStoreTrades, getAccumulatedTrades, getPollStats, clearAccumulatedTrades } from './trades.js';
 
 export default {
-  // Scheduled cron handler
+  // Scheduled cron handler - runs every minute to accumulate trades
   async scheduled(event, env, ctx) {
     console.log("Cron triggered:", event.cron);
     
     try {
-      // Run settlement check
-      const settlementResults = await processSettledSignals(env);
-      console.log("Settlement results:", settlementResults);
+      // ALWAYS poll for trades first (this runs every minute)
+      const pollResult = await pollAndStoreTrades(env);
+      console.log("Trade poll result:", pollResult);
+      
+      // Run settlement check less frequently (check if it's been >10 minutes)
+      let settlementResults = null;
+      const lastSettlement = await env.SIGNALS_CACHE?.get('last_settlement_run');
+      const lastSettlementTime = lastSettlement ? new Date(lastSettlement).getTime() : 0;
+      const minutesSinceSettlement = (Date.now() - lastSettlementTime) / 60000;
+      
+      if (minutesSinceSettlement > 10) {
+        settlementResults = await processSettledSignals(env);
+        console.log("Settlement results:", settlementResults);
+        await env.SIGNALS_CACHE?.put('last_settlement_run', new Date().toISOString());
+      }
       
       // Store cron stats
       if (env.SIGNALS_CACHE) {
         await env.SIGNALS_CACHE.put(KV_KEYS.LAST_CRON_RUN, new Date().toISOString());
         await env.SIGNALS_CACHE.put(KV_KEYS.CRON_STATS, JSON.stringify({
           lastRun: new Date().toISOString(),
+          tradePoll: pollResult,
           settlement: settlementResults
         }));
       }
@@ -84,6 +98,55 @@ export default {
         const signalId = path.split("/")[2];
         const signal = await getSignal(env, signalId);
         return jsonResponse({ success: !!signal, signal });
+      }
+      
+      // ============ TRADE ACCUMULATION ENDPOINTS ============
+      
+      // Manual poll trigger (for testing)
+      if (path === "/trades/poll") {
+        const result = await pollAndStoreTrades(env);
+        return jsonResponse(result);
+      }
+      
+      // Get poll stats
+      if (path === "/trades/stats") {
+        const stats = await getPollStats(env);
+        return jsonResponse({ success: true, ...stats });
+      }
+      
+      // Get accumulated trades count
+      if (path === "/trades/accumulated") {
+        const hours = parseInt(url.searchParams.get("hours") || "48");
+        const result = await getAccumulatedTrades(env, hours);
+        return jsonResponse({
+          success: true,
+          fromKV: result.fromKV,
+          totalTrades: result.trades?.length || 0,
+          bucketsRead: result.bucketsRead || 0,
+          oldestTrade: result.trades?.length > 0 
+            ? new Date(result.trades[result.trades.length - 1].timestamp * 1000).toISOString()
+            : null,
+          newestTrade: result.trades?.length > 0
+            ? new Date(result.trades[0].timestamp * 1000).toISOString()
+            : null,
+          // Don't return all trades - just stats
+          sampleTrades: result.trades?.slice(0, 5).map(t => ({
+            title: t.title,
+            size: t.size,
+            price: t.price,
+            time: new Date(t.timestamp * 1000).toISOString()
+          }))
+        });
+      }
+      
+      // Clear accumulated trades (admin)
+      if (path === "/trades/clear" && request.method === "POST") {
+        const authHeader = request.headers.get("Authorization");
+        if (authHeader !== "Bearer polymarket-admin-2026") {
+          return jsonResponse({ error: "Unauthorized" }, 401);
+        }
+        const result = await clearAccumulatedTrades(env);
+        return jsonResponse(result);
       }
       
       // ============ WALLET ENDPOINTS ============
@@ -210,17 +273,21 @@ export default {
           const sampleTrades = sportsTrades.slice(0, 30).map(t => ({
             eventSlug: t.eventSlug,
             slug: t.slug,
+            title: t.title,
             outcome: t.outcome,
             price: t.price,
-            timestamp: t.timestamp
+            size: t.size,
+            timestamp: t.timestamp,
+            timeAgo: Math.round((Date.now() - t.timestamp * 1000) / 60000) + ' min ago'
           }));
           
           return jsonResponse({
             success: true,
             sport,
-            totalTrades: sportsTrades.length,
-            uniqueMarkets: uniqueSlugs.length,
-            slugs: uniqueSlugs.slice(0, 20),
+            totalTrades: allTrades.length,
+            sportsTrades: sportsTrades.length,
+            uniqueGames: uniqueSlugs.length,
+            slugs: uniqueSlugs,
             sampleTrades
           });
         } catch (e) {
@@ -233,7 +300,7 @@ export default {
         const sportKey = SPORT_KEY_MAP[sport.toLowerCase()];
         
         if (!sportKey) {
-          return jsonResponse({ success: false, error: `Unknown sport: ${sport}` });
+          return jsonResponse({ error: `Unknown sport: ${sport}` }, 400);
         }
         
         const odds = await getGameOdds(env, sportKey);
@@ -242,87 +309,31 @@ export default {
       
       if (path === "/odds/scores") {
         const sport = url.searchParams.get("sport") || "nba";
-        const days = parseInt(url.searchParams.get("days") || "3");
         const sportKey = SPORT_KEY_MAP[sport.toLowerCase()];
         
         if (!sportKey) {
-          return jsonResponse({ success: false, error: `Unknown sport: ${sport}` });
+          return jsonResponse({ error: `Unknown sport: ${sport}` }, 400);
         }
         
-        const scores = await getGameScores(env, sportKey, days);
-        return jsonResponse({ success: true, sport, daysBack: days, games: scores || [] });
+        const scores = await getGameScores(env, sportKey);
+        return jsonResponse({ success: true, sport, scores });
       }
       
-      // ============ LEARNING/DEBUG ENDPOINTS ============
+      // ============ LEARNING/AI ENDPOINTS ============
       
       if (path === "/learning/stats") {
-        if (!env.SIGNALS_CACHE) {
-          return jsonResponse({ success: false, error: "No cache configured" });
-        }
-        
-        const factorStats = await getFactorStats(env);
-        const pending = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
-        const walletIndex = await getTrackedWallets(env);
-        const aiRecommendation = await getAIRecommendation(env);
-        
-        // Calculate overall stats
-        let totalWins = 0;
-        let totalLosses = 0;
-        for (const stats of Object.values(factorStats)) {
-          totalWins += stats.wins || 0;
-          totalLosses += stats.losses || 0;
-        }
-        const totalProcessed = totalWins + totalLosses;
-        const overallWinRate = totalProcessed > 0 ? Math.round((totalWins / totalProcessed) * 100) : 0;
-        
-        return jsonResponse({
-          success: true,
-          pendingSignals: pending.length,
-          trackedWallets: walletIndex.length,
-          factorStats,
-          totalFactors: Object.keys(factorStats).length,
-          signalsProcessed: totalProcessed,
-          overallWinRate,
-          totalWins,
-          totalLosses,
-          aiRecommendation
-        });
+        const stats = await getFactorStats(env);
+        return jsonResponse({ success: true, stats });
       }
       
-      // AI Recommendation endpoint
+      if (path === "/learning/patterns") {
+        const patterns = await getDiscoveredPatterns(env);
+        return jsonResponse({ success: true, patterns });
+      }
+      
       if (path === "/learning/recommendation") {
         const recommendation = await getAIRecommendation(env);
-        return jsonResponse({
-          success: true,
-          ...recommendation
-        });
-      }
-      
-      // Discovered patterns endpoint - shows auto-discovered trends
-      if (path === "/learning/patterns" || path === "/learning/discoveries") {
-        const patterns = await getDiscoveredPatterns(env);
-        const factorStats = await getFactorStats(env);
-        
-        // Find all discovered factors
-        const discoveredFactors = Object.entries(factorStats)
-          .filter(([name, stats]) => stats.isDiscovered)
-          .map(([name, stats]) => ({
-            name,
-            winRate: stats.winRate,
-            record: `${stats.wins}W-${stats.losses}L`,
-            weight: stats.weight,
-            discoveredAt: stats.discoveredAt,
-            category: stats.category
-          }))
-          .sort((a, b) => b.winRate - a.winRate);
-        
-        return jsonResponse({
-          success: true,
-          discoveredFactors,
-          totalDiscovered: discoveredFactors.length,
-          patternsNearPromotion: patterns.nearPromotion,
-          tracking: patterns.allTracking
-        });
+        return jsonResponse({ success: true, recommendation });
       }
       
       // Learning leaderboard - returns wallet data in format expected by WhaleWatchers
@@ -418,11 +429,13 @@ export default {
         
         const lastRun = await env.SIGNALS_CACHE.get(KV_KEYS.LAST_CRON_RUN);
         const stats = await env.SIGNALS_CACHE.get(KV_KEYS.CRON_STATS, { type: "json" });
+        const pollStats = await getPollStats(env);
         
         return jsonResponse({
           success: true,
           lastRun,
           stats,
+          pollStats,
           minutesSinceRun: lastRun ? Math.round((Date.now() - new Date(lastRun).getTime()) / 60000) : null
         });
       }
@@ -443,9 +456,6 @@ export default {
           // Clear wallet index
           await env.SIGNALS_CACHE.delete("tracked_wallet_index");
           clearedKeys.push("tracked_wallet_index");
-          
-          // Get and clear all wallet_* keys (the old format that has null addresses)
-          // Note: KV doesn't support list, so we just clear the index which is the main issue
           
           return jsonResponse({ 
             success: true, 
@@ -510,10 +520,9 @@ export default {
             "GET /wallets/leaderboard - Get wallet leaderboard",
             "GET /wallet/{address}/stats - Get wallet stats",
             "GET /odds/compare-all?sport=nba - Vegas vs Polymarket comparison",
-            "GET /odds/compare?sport=nba - Vegas odds only",
-            "GET /odds/scores?sport=nba - Game scores",
-            "GET /learning/stats - AI learning stats",
-            "GET /settlement/run - Manual settlement trigger",
+            "GET /trades/poll - Manual trade poll trigger",
+            "GET /trades/stats - Trade accumulation stats",
+            "GET /trades/accumulated - View accumulated trades",
             "GET /cron-status - Cron job status"
           ]
         });
