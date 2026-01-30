@@ -1,0 +1,4032 @@
+// src/index.js
+var POLYMARKET_API = "https://data-api.polymarket.com";
+// SCORING SYSTEM v8 - Adaptive Learning System
+// Base scores that get multiplied by learned factor weights
+var SCORES = {
+  // WHALE BET SIZE (single bet)
+  WHALE_BET_MASSIVE: 80,    // $50k+ single bet - definite whale
+  WHALE_BET_LARGE: 60,      // $25k+ single bet - large whale
+  WHALE_BET_NOTABLE: 45,    // $15k+ single bet - notable bet
+  WHALE_BET_MEDIUM: 30,     // $8k+ single bet - solid bet
+  WHALE_BET_SMALL: 15,      // $3k+ single bet - worth noting
+  
+  // CONCENTRATION (few wallets controlling the action)
+  CONCENTRATION_SINGLE_WHALE: 25,  // 1 wallet has >80% AND bet $10k+
+  CONCENTRATION_WHALE_DUO: 15,     // 2 wallets have >80% AND both bet $5k+
+  CONCENTRATION_HIGH: 10,          // Top wallet has >60% of volume AND $5k+
+  
+  // FRESH WALLET + MONEY (hiding identity - insider signal)
+  // Does NOT stack with whale bet - it's one or the other
+  FRESH_WHALE_HUGE: 80,     // Fresh wallet betting $50k+
+  FRESH_WHALE_LARGE: 60,    // Fresh wallet betting $25k+
+  FRESH_WHALE_NOTABLE: 45,  // Fresh wallet betting $10k+
+  FRESH_WHALE_MEDIUM: 30,   // Fresh wallet betting $5k+
+  FRESH_WALLET_SMALL: 15,   // Fresh wallet betting $2k+
+  
+  // COORDINATED (multiple wallets acting together)
+  COORDINATED_WHALES: 30,   // 3+ wallets ALL betting $5k+ within 2hrs
+  COORDINATED_LARGE: 15,    // 3+ wallets ALL betting $2k+ within 2hrs
+  
+  // VOLUME
+  VOLUME_MASSIVE: 20,       // >$100k total
+  VOLUME_LARGE: 15,         // >$50k total
+  VOLUME_NOTABLE: 10,       // >$25k total
+  VOLUME_MEDIUM: 5,         // >$10k total
+  
+  // MARKET TYPE (minor factor)
+  POLITICAL: 5,             // Elections can have insider info
+  SPORTS: 3,                // Injury news, etc
+  CRYPTO: 3,                // Less insider advantage
+  
+  // TIMING/ODDS
+  EXTREME_ODDS: 15,         // Betting heavy on long shots (>85% or <15%)
+  MODERATE_ODDS: 5,         // Betting on favorites/underdogs (>75% or <25%)
+  RAPID_ACCUMULATION: 10,   // Large position built quickly
+  
+  // LAST-MINUTE WHALE (urgent insider info)
+  LAST_MINUTE_WHALE_2H: 25, // $10k+ bet within 2 hours of event
+  LAST_MINUTE_WHALE_6H: 15, // $10k+ bet within 6 hours of event
+  LAST_MINUTE_WHALE_12H: 10, // $10k+ bet within 12 hours of event
+  
+  // PROVEN WINNER WALLET (track record - THE HOLY GRAIL)
+  PROVEN_WINNER_ELITE: 80,  // 70%+ win rate
+  PROVEN_WINNER_STRONG: 50, // 65-70% win rate
+  PROVEN_WINNER_GOOD: 30,   // 60-65% win rate
+  PROVEN_WINNER_EDGE: 15,   // 55-60% win rate
+  
+  // WHALE + PROVEN WINNER COMBO
+  WHALE_PROVEN_WINNER: 30,  // $25k+ bet from a proven winner wallet
+  
+  // ============================================
+  // PHASE 2: NEW SCORING FACTORS
+  // ============================================
+  
+  // LINE MOVEMENT CONFIRMATION
+  LINE_MOVE_STRONG: 25,     // Price moved 10%+ in our direction after whale bet
+  LINE_MOVE_MODERATE: 15,   // Price moved 5-10% in our direction
+  LINE_MOVE_SLIGHT: 8,      // Price moved 2-5% in our direction
+  
+  // SHARP VS PUBLIC DIVERGENCE
+  SHARP_VS_PUBLIC: 35,      // Whales betting opposite of small bettors
+  SMART_MONEY_FADE: 20,     // Multiple small bets one way, one whale the other
+  
+  // WALLET TIER MULTIPLIERS (applied to final score)
+  TIER_ELITE_MULTIPLIER: 1.5,    // 70%+ win rate wallet
+  TIER_STRONG_MULTIPLIER: 1.25,  // 62%+ win rate wallet
+  TIER_FADE_MULTIPLIER: 0.5,     // <45% win rate wallet (fade these!)
+  
+  // SAME WALLET MULTI-MARKET (high confidence)
+  MULTI_MARKET_SAME_WALLET: 25,  // Same wallet betting related markets
+  
+  // STREAK BONUS
+  HOT_STREAK_BONUS: 20,     // Wallet on 5+ win streak
+  COLD_STREAK_PENALTY: -15  // Wallet on 5+ loss streak
+};
+
+// Minimum requirements for wallet track record
+var WALLET_TRACK_RECORD = {
+  MIN_BETS: 10,             // Minimum resolved bets to count
+  LOOKBACK_DAYS: 30,        // Only count bets from last 30 days
+  MIN_BET_FOR_CHECK: 50000, // Only check win rate for wallets betting $50k+
+  CACHE_HOURS: 6            // How long to cache wallet stats
+};
+
+// ============================================================
+// PHASE 1: LEARNING SYSTEM
+// Auto-track wallets, store signals, learn from outcomes
+// ============================================================
+
+// Wallet tier thresholds
+var WALLET_TIERS = {
+  ELITE: { minWinRate: 70, minBets: 10, scoreBoost: 1.5, label: "🏆 ELITE" },
+  STRONG: { minWinRate: 62, minBets: 8, scoreBoost: 1.25, label: "💪 STRONG" },
+  AVERAGE: { minWinRate: 50, minBets: 5, scoreBoost: 1.0, label: "📊 AVERAGE" },
+  FADE: { maxWinRate: 45, minBets: 8, scoreBoost: 0.5, label: "🚫 FADE" }
+};
+
+// Factor tracking keys
+var TRACKABLE_FACTORS = [
+  "freshWallet", "whaleSize50k", "whaleSize25k", "whaleSize15k",
+  "lastMinute2h", "lastMinute6h", "concentrated", "coordinated",
+  "extremeOdds", "politicalMarket", "sportsMarket", "cryptoMarket"
+];
+
+// KV Keys
+var KV_KEYS = {
+  WALLETS_PREFIX: "wallet:",           // wallet:{address} -> wallet stats
+  SIGNALS_PREFIX: "signal:",           // signal:{id} -> signal details for learning
+  PENDING_SIGNALS: "pending_signals",  // Array of signal IDs awaiting settlement
+  FACTOR_STATS: "factor_stats",        // Factor performance tracking
+  LEARNING_META: "learning_meta"       // Metadata about learning system
+};
+
+// ============================================================
+// WALLET TRACKING FUNCTIONS
+// ============================================================
+
+// Get wallet tier based on stats
+function getWalletTier(stats) {
+  if (!stats || stats.totalBets < 5) return null;
+  
+  const winRate = stats.winRate || 0;
+  const totalBets = stats.totalBets || 0;
+  
+  if (winRate >= WALLET_TIERS.ELITE.minWinRate && totalBets >= WALLET_TIERS.ELITE.minBets) {
+    return { ...WALLET_TIERS.ELITE, tier: "ELITE" };
+  }
+  if (winRate >= WALLET_TIERS.STRONG.minWinRate && totalBets >= WALLET_TIERS.STRONG.minBets) {
+    return { ...WALLET_TIERS.STRONG, tier: "STRONG" };
+  }
+  if (winRate <= WALLET_TIERS.FADE.maxWinRate && totalBets >= WALLET_TIERS.FADE.minBets) {
+    return { ...WALLET_TIERS.FADE, tier: "FADE" };
+  }
+  if (totalBets >= WALLET_TIERS.AVERAGE.minBets) {
+    return { ...WALLET_TIERS.AVERAGE, tier: "AVERAGE" };
+  }
+  return null;
+}
+
+// Save/update wallet stats in KV
+async function updateWalletStats(env, walletAddress, betData) {
+  if (!env.SIGNALS_CACHE || !walletAddress) return null;
+  
+  const key = KV_KEYS.WALLETS_PREFIX + walletAddress.toLowerCase();
+  
+  try {
+    // Get existing stats
+    let stats = await env.SIGNALS_CACHE.get(key, { type: "json" });
+    
+    const isNewWallet = !stats;
+    
+    if (!stats) {
+      stats = {
+        address: walletAddress.toLowerCase(),
+        totalBets: 0,
+        wins: 0,
+        losses: 0,
+        pending: 0,
+        winRate: 0,
+        totalVolume: 0,
+        avgBetSize: 0,
+        profitLoss: 0,
+        lastSeen: null,
+        firstSeen: new Date().toISOString(),
+        tier: null,
+        currentStreak: 0,
+        bestStreak: 0,
+        markets: {},        // Track performance by market type
+        recentBets: []      // Last 20 bets for reference
+      };
+    }
+    
+    // Update with new bet data
+    if (betData) {
+      stats.totalVolume += betData.amount || 0;
+      stats.lastSeen = new Date().toISOString();
+      stats.pending += 1;
+      
+      // Track bet for later resolution
+      if (stats.recentBets.length >= 20) {
+        stats.recentBets.shift(); // Remove oldest
+      }
+      stats.recentBets.push({
+        signalId: betData.signalId,
+        market: betData.market,
+        marketSlug: betData.marketSlug,
+        direction: betData.direction,
+        amount: betData.amount,
+        price: betData.price,
+        time: new Date().toISOString(),
+        outcome: null // Will be filled on settlement
+      });
+      
+      // Update average bet size
+      const totalBetsIncludingPending = stats.totalBets + stats.pending;
+      if (totalBetsIncludingPending > 0) {
+        stats.avgBetSize = Math.round(stats.totalVolume / totalBetsIncludingPending);
+      }
+    }
+    
+    // Save to KV (expire after 90 days of no activity)
+    await env.SIGNALS_CACHE.put(key, JSON.stringify(stats), {
+      expirationTtl: 90 * 24 * 60 * 60
+    });
+    
+    // Add to wallet index if new
+    if (isNewWallet) {
+      try {
+        let index = await env.SIGNALS_CACHE.get("tracked_wallet_index", { type: "json" }) || [];
+        if (!index.includes(walletAddress.toLowerCase())) {
+          index.push(walletAddress.toLowerCase());
+          // Keep only last 500 wallets
+          if (index.length > 500) {
+            index = index.slice(-500);
+          }
+          await env.SIGNALS_CACHE.put("tracked_wallet_index", JSON.stringify(index), {
+            expirationTtl: 90 * 24 * 60 * 60
+          });
+        }
+      } catch (e) {
+        console.log("Error updating wallet index:", e.message);
+      }
+    }
+    
+    return stats;
+  } catch (e) {
+    console.error("Error updating wallet stats:", e.message);
+    return null;
+  }
+}
+
+// Get wallet stats from KV
+async function getWalletStats(env, walletAddress) {
+  if (!env.SIGNALS_CACHE || !walletAddress) return null;
+  
+  const key = KV_KEYS.WALLETS_PREFIX + walletAddress.toLowerCase();
+  
+  try {
+    const stats = await env.SIGNALS_CACHE.get(key, { type: "json" });
+    if (stats) {
+      stats.tierInfo = getWalletTier(stats);
+    }
+    return stats;
+  } catch (e) {
+    console.error("Error getting wallet stats:", e.message);
+    return null;
+  }
+}
+
+// Record bet outcome for a wallet
+async function recordWalletOutcome(env, walletAddress, outcome, profitLoss, marketType) {
+  if (!env.SIGNALS_CACHE || !walletAddress) return null;
+  
+  const key = KV_KEYS.WALLETS_PREFIX + walletAddress.toLowerCase();
+  
+  try {
+    let stats = await env.SIGNALS_CACHE.get(key, { type: "json" });
+    if (!stats) return null;
+    
+    // Update stats
+    stats.totalBets += 1;
+    stats.pending = Math.max(0, stats.pending - 1);
+    
+    if (outcome === "WIN") {
+      stats.wins += 1;
+      stats.currentStreak = Math.max(0, stats.currentStreak) + 1;
+      stats.bestStreak = Math.max(stats.bestStreak, stats.currentStreak);
+    } else {
+      stats.losses += 1;
+      stats.currentStreak = Math.min(0, stats.currentStreak) - 1;
+    }
+    
+    stats.profitLoss += profitLoss || 0;
+    stats.winRate = stats.totalBets > 0 ? Math.round((stats.wins / stats.totalBets) * 100) : 0;
+    stats.tier = getWalletTier(stats)?.tier || null;
+    
+    // Track by market type
+    if (marketType) {
+      if (!stats.markets[marketType]) {
+        stats.markets[marketType] = { wins: 0, losses: 0, winRate: 0 };
+      }
+      if (outcome === "WIN") {
+        stats.markets[marketType].wins += 1;
+      } else {
+        stats.markets[marketType].losses += 1;
+      }
+      const mt = stats.markets[marketType];
+      mt.winRate = Math.round((mt.wins / (mt.wins + mt.losses)) * 100);
+    }
+    
+    await env.SIGNALS_CACHE.put(key, JSON.stringify(stats), {
+      expirationTtl: 90 * 24 * 60 * 60
+    });
+    
+    return stats;
+  } catch (e) {
+    console.error("Error recording wallet outcome:", e.message);
+    return null;
+  }
+}
+
+// ============================================================
+// SIGNAL STORAGE FOR LEARNING
+// ============================================================
+
+// Store signal for later learning
+async function storeSignalForLearning(env, signal, factors, wallets) {
+  if (!env.SIGNALS_CACHE) return;
+  
+  const signalData = {
+    id: signal.id,
+    marketSlug: signal.marketSlug,
+    marketTitle: signal.marketTitle,
+    direction: signal.direction,
+    score: signal.score,
+    factors: factors,           // Array of factor keys that contributed
+    wallets: wallets,           // Array of wallet addresses involved
+    largestBet: signal.largestBet,
+    totalVolume: signal.suspiciousVolume,
+    priceAtSignal: signal.avgEntryPrice,
+    priceAfter30min: null,      // Will be filled by line movement tracker
+    priceAfter1hr: null,
+    eventDate: signal.eventDate,
+    detectedAt: signal.detectedAt,
+    outcome: null,              // WIN/LOSS - filled on settlement
+    settledAt: null,
+    profitLoss: null
+  };
+  
+  try {
+    // Store individual signal
+    const signalKey = KV_KEYS.SIGNALS_PREFIX + signal.id;
+    await env.SIGNALS_CACHE.put(signalKey, JSON.stringify(signalData), {
+      expirationTtl: 30 * 24 * 60 * 60 // Keep for 30 days
+    });
+    
+    // Add to pending signals list
+    let pendingSignals = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+    
+    // Avoid duplicates
+    if (!pendingSignals.includes(signal.id)) {
+      pendingSignals.push(signal.id);
+      
+      // Keep only last 500 pending signals
+      if (pendingSignals.length > 500) {
+        pendingSignals = pendingSignals.slice(-500);
+      }
+      
+      await env.SIGNALS_CACHE.put(KV_KEYS.PENDING_SIGNALS, JSON.stringify(pendingSignals));
+    }
+    
+    console.log(`Stored signal for learning: ${signal.id}`);
+  } catch (e) {
+    console.error("Error storing signal for learning:", e.message);
+  }
+}
+
+// ============================================================
+// FACTOR PERFORMANCE TRACKING
+// ============================================================
+
+// Update factor stats after outcome
+async function updateFactorStats(env, factors, outcome) {
+  if (!env.SIGNALS_CACHE || !factors || factors.length === 0) return;
+  
+  try {
+    let factorStats = await env.SIGNALS_CACHE.get(KV_KEYS.FACTOR_STATS, { type: "json" }) || {};
+    
+    for (const factor of factors) {
+      if (!factorStats[factor]) {
+        factorStats[factor] = {
+          wins: 0,
+          losses: 0,
+          winRate: 50,
+          weight: 1.0,
+          lastUpdated: null
+        };
+      }
+      
+      if (outcome === "WIN") {
+        factorStats[factor].wins += 1;
+      } else {
+        factorStats[factor].losses += 1;
+      }
+      
+      const total = factorStats[factor].wins + factorStats[factor].losses;
+      factorStats[factor].winRate = Math.round((factorStats[factor].wins / total) * 100);
+      
+      // Adjust weight based on performance (0.5 to 2.0 range)
+      // Factors with >60% win rate get boosted, <40% get reduced
+      factorStats[factor].weight = Math.max(0.5, Math.min(2.0, 
+        0.5 + (factorStats[factor].winRate / 100) * 1.5
+      ));
+      
+      factorStats[factor].lastUpdated = new Date().toISOString();
+    }
+    
+    await env.SIGNALS_CACHE.put(KV_KEYS.FACTOR_STATS, JSON.stringify(factorStats));
+    console.log(`Updated factor stats for ${factors.length} factors`);
+  } catch (e) {
+    console.error("Error updating factor stats:", e.message);
+  }
+}
+
+// Get current factor weights for scoring
+async function getFactorWeights(env) {
+  if (!env.SIGNALS_CACHE) return {};
+  
+  try {
+    const factorStats = await env.SIGNALS_CACHE.get(KV_KEYS.FACTOR_STATS, { type: "json" }) || {};
+    const weights = {};
+    
+    for (const [factor, stats] of Object.entries(factorStats)) {
+      weights[factor] = stats.weight || 1.0;
+    }
+    
+    return weights;
+  } catch (e) {
+    console.error("Error getting factor weights:", e.message);
+    return {};
+  }
+}
+
+// ============================================================
+// SETTLEMENT CHECKER
+// ============================================================
+
+// Check if a market has settled and determine outcome
+async function checkMarketSettlement(marketSlug, signalDirection) {
+  try {
+    // Since Polymarket doesn't have direct market lookup, we check recent trades
+    // If a market's last trade price is at 0.95+ or 0.05-, it's effectively settled
+    
+    // Fetch recent trades and look for ones matching our slug
+    const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=2000`);
+    if (!tradesRes.ok) {
+      console.log(`Trades API error: ${tradesRes.status}`);
+      return null;
+    }
+    
+    const trades = await tradesRes.json();
+    
+    // Find trades for this market - EXACT match only on slug or eventSlug
+    let marketTrades = trades.filter(t => 
+      t.slug === marketSlug || 
+      t.eventSlug === marketSlug
+    );
+    
+    // If no exact match and this is a spread/total market, try matching base event slug
+    if (marketTrades.length === 0 && (marketSlug.includes('-spread') || marketSlug.includes('-total') || marketSlug.includes('-over') || marketSlug.includes('-under'))) {
+      // Extract base slug without the spread/total suffix
+      const baseSlug = marketSlug.replace(/-spread.*$/, '').replace(/-total.*$/, '').replace(/-over.*$/, '').replace(/-under.*$/, '');
+      
+      // Only match if the trade slug EXACTLY equals our base slug
+      marketTrades = trades.filter(t => 
+        t.slug === baseSlug ||
+        t.eventSlug === baseSlug
+      );
+    }
+    
+    // Check event date for time-based settlement
+    const slugDateMatch = (marketSlug || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+    let hoursSinceEvent = 0;
+    
+    if (slugDateMatch) {
+      const eventDate = new Date(
+        parseInt(slugDateMatch[1]),
+        parseInt(slugDateMatch[2]) - 1,
+        parseInt(slugDateMatch[3]),
+        23, 59, 59
+      );
+      
+      const now = new Date();
+      hoursSinceEvent = (now.getTime() - eventDate.getTime()) / (1000 * 60 * 60);
+    }
+    
+    if (marketTrades.length === 0) {
+      // No trades found for this market
+      
+      // Sports events typically end within a few hours of their scheduled date
+      // If it's been 12+ hours since end of event day (23:59 UTC) and no trades,
+      // the market is definitely settled but we can't determine winner
+      if (hoursSinceEvent > 12) {
+        console.log(`Market ${marketSlug} is ${Math.round(hoursSinceEvent)}h past event with no recent trades - marking UNKNOWN`);
+        return { 
+          settled: true, 
+          winningOutcome: "UNKNOWN", 
+          resolutionPrice: 0,
+          note: `Event ${Math.round(hoursSinceEvent)}h ago, no recent trades to determine outcome`
+        };
+      }
+      
+      // Return debug info about why not settling
+      console.log(`No trades found for ${marketSlug} (event ${Math.round(hoursSinceEvent)}h ago, need >12h)`);
+      return { 
+        settled: false, 
+        debug: {
+          tradesFound: 0,
+          hoursSinceEvent: Math.round(hoursSinceEvent),
+          needsHours: 12,
+          slugDateMatch: slugDateMatch ? slugDateMatch[0] : null
+        }
+      };
+    }
+    
+    // Sort by timestamp to get most recent
+    marketTrades.sort((a, b) => b.timestamp - a.timestamp);
+    const latestTrade = marketTrades[0];
+    const latestPrice = parseFloat(latestTrade.price);
+    
+    console.log(`Market ${marketSlug}: found ${marketTrades.length} trades, latest price=${latestPrice}, outcome=${latestTrade.outcome}, event ${Math.round(hoursSinceEvent)}h ago`);
+    
+    // STRICT settlement thresholds: 95%/5%
+    // We don't want to falsely settle markets where someone is betting at 80-90%
+    // Those bets could still lose!
+    if (latestPrice >= 0.95) {
+      return {
+        settled: true,
+        winningOutcome: latestTrade.outcome || "Yes",
+        resolutionPrice: latestPrice
+      };
+    }
+    
+    if (latestPrice <= 0.05) {
+      let winningOutcome = "No";
+      if (latestTrade.outcome === "No") {
+        winningOutcome = "Yes";
+      } else if (latestTrade.outcome === "Yes") {
+        winningOutcome = "No";
+      }
+      return {
+        settled: true,
+        winningOutcome: winningOutcome,
+        resolutionPrice: 1 - latestPrice,
+        losingOutcome: latestTrade.outcome
+      };
+    }
+    
+    // If event was long ago with ambiguous price, mark as unknown
+    // 24h should be plenty of time for price to reach settlement levels
+    if (hoursSinceEvent > 24) {
+      console.log(`Market ${marketSlug} is ${Math.round(hoursSinceEvent)}h past event with ambiguous price ${latestPrice} - marking UNKNOWN`);
+      return { 
+        settled: true, 
+        winningOutcome: "UNKNOWN", 
+        resolutionPrice: latestPrice,
+        note: `Event ${Math.round(hoursSinceEvent)}h ago, price=${latestPrice} ambiguous`
+      };
+    }
+    
+    // Not settled yet
+    return { settled: false, currentPrice: latestPrice };
+    
+  } catch (e) {
+    console.error(`Error checking settlement for ${marketSlug}:`, e.message);
+    return null;
+  }
+}
+
+// Process settled signals and update learning data
+async function processSettledSignals(env) {
+  if (!env.SIGNALS_CACHE) return { processed: 0, wins: 0, losses: 0 };
+  
+  const results = { processed: 0, wins: 0, losses: 0, errors: 0 };
+  
+  try {
+    // Get pending signals
+    let pendingSignals = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+    const stillPending = [];
+    
+    console.log(`Checking ${pendingSignals.length} pending signals for settlement...`);
+    
+    for (const signalId of pendingSignals) {
+      try {
+        // Get signal data
+        const signalKey = KV_KEYS.SIGNALS_PREFIX + signalId;
+        const signalData = await env.SIGNALS_CACHE.get(signalKey, { type: "json" });
+        
+        if (!signalData) {
+          continue; // Signal expired or deleted
+        }
+        
+        // Skip if already settled
+        if (signalData.outcome) {
+          continue;
+        }
+        
+        // Check if market settled
+        const settlement = await checkMarketSettlement(signalData.marketSlug);
+        
+        if (!settlement || !settlement.settled) {
+          stillPending.push(signalId);
+          continue;
+        }
+        
+        // Handle UNKNOWN outcomes (API data unavailable but event passed)
+        if (settlement.winningOutcome === "UNKNOWN") {
+          console.log(`Signal ${signalId} has unknown outcome - removing from pending`);
+          signalData.outcome = "UNKNOWN";
+          signalData.settledAt = new Date().toISOString();
+          signalData.note = settlement.note;
+          await env.SIGNALS_CACHE.put(signalKey, JSON.stringify(signalData), {
+            expirationTtl: 7 * 24 * 60 * 60  // Keep for 7 days for review
+          });
+          results.processed += 1;
+          continue;
+        }
+        
+        // Determine if our signal won or lost
+        const signalDirection = (signalData.direction || "").toLowerCase();
+        const winningOutcome = (settlement.winningOutcome || "").toLowerCase();
+        
+        // Normalize direction names for comparison
+        // Handle cases like "Hornets" vs "yes", "Cortes-Acosta" vs "Yes"
+        let outcome = "LOSS";
+        
+        // Direct match
+        if (signalDirection === winningOutcome) {
+          outcome = "WIN";
+        }
+        // Yes/No normalization
+        else if ((signalDirection === "yes" || signalDirection === "true") && 
+                 (winningOutcome === "yes" || winningOutcome === "true")) {
+          outcome = "WIN";
+        }
+        else if ((signalDirection === "no" || signalDirection === "false") && 
+                 (winningOutcome === "no" || winningOutcome === "false")) {
+          outcome = "WIN";
+        }
+        // If direction contains team name and outcome is "yes", check if it was the favored team
+        // This is tricky - for now, if price went to 0.95+ and we bet on that side, we won
+        else if (settlement.resolutionPrice >= 0.90) {
+          // High price = YES won
+          // Check if signal direction indicates YES
+          if (signalDirection === "yes" || 
+              signalDirection.includes("over") ||
+              signalDirection.includes("cover")) {
+            outcome = "WIN";
+          }
+        }
+        else if (settlement.resolutionPrice <= 0.10) {
+          // Low price = NO won
+          if (signalDirection === "no" ||
+              signalDirection.includes("under") ||
+              signalDirection.includes("fail")) {
+            outcome = "WIN";
+          }
+        }
+        
+        // Calculate profit/loss
+        const entryPrice = signalData.priceAtSignal / 100;
+        const resolutionPrice = settlement.resolutionPrice;
+        const profitPct = outcome === "WIN" 
+          ? Math.round(((1 - entryPrice) / entryPrice) * 100)  // Payout is $1 for a win
+          : -100;
+        
+        // Update signal data
+        signalData.outcome = outcome;
+        signalData.settledAt = new Date().toISOString();
+        signalData.profitLoss = profitPct;
+        signalData.winningOutcome = settlement.winningOutcome;
+        
+        await env.SIGNALS_CACHE.put(signalKey, JSON.stringify(signalData), {
+          expirationTtl: 30 * 24 * 60 * 60
+        });
+        
+        // Update factor stats
+        if (signalData.factors && signalData.factors.length > 0) {
+          await updateFactorStats(env, signalData.factors, outcome);
+        }
+        
+        // Update wallet stats for each wallet involved
+        const marketType = detectMarketType(signalData.marketTitle);
+        for (const wallet of (signalData.wallets || [])) {
+          await recordWalletOutcome(env, wallet, outcome, profitPct, marketType);
+        }
+        
+        results.processed += 1;
+        if (outcome === "WIN") {
+          results.wins += 1;
+        } else {
+          results.losses += 1;
+        }
+        
+        console.log(`Signal ${signalId} settled: ${outcome}`);
+        
+      } catch (e) {
+        console.error(`Error processing signal ${signalId}:`, e.message);
+        results.errors += 1;
+        stillPending.push(signalId); // Keep for retry
+      }
+    }
+    
+    // Update pending list
+    await env.SIGNALS_CACHE.put(KV_KEYS.PENDING_SIGNALS, JSON.stringify(stillPending));
+    
+    console.log(`Settlement check complete: ${results.processed} processed, ${results.wins} wins, ${results.losses} losses`);
+    
+  } catch (e) {
+    console.error("Error in settlement checker:", e.message);
+  }
+  
+  return results;
+}
+
+// Helper to detect market type from title
+function detectMarketType(title) {
+  const titleLower = (title || "").toLowerCase();
+  
+  if (POLITICAL_KEYWORDS.some(k => titleLower.includes(k))) return "political";
+  if (SPORTS_KEYWORDS.some(k => titleLower.includes(k))) return "sports";
+  if (CRYPTO_KEYWORDS.some(k => titleLower.includes(k))) return "crypto";
+  return "other";
+}
+
+// ============================================================
+// PHASE 2: ADVANCED LEARNING FEATURES
+// ============================================================
+
+// LINE MOVEMENT TRACKING
+// Track price changes after whale bets to see if market confirms
+var KV_LINE_MOVEMENT_PREFIX = "line:";
+
+async function trackLineMovement(env, marketSlug, direction, entryPrice, signalId) {
+  if (!env.SIGNALS_CACHE) return;
+  
+  const key = KV_LINE_MOVEMENT_PREFIX + signalId;
+  const data = {
+    marketSlug,
+    direction,
+    entryPrice,
+    signalId,
+    trackedAt: Date.now(),
+    priceAfter5min: null,
+    priceAfter30min: null,
+    priceAfter1hr: null,
+    priceAfter2hr: null,
+    movementPct: null,
+    confirmed: null  // true if line moved in our direction
+  };
+  
+  try {
+    await env.SIGNALS_CACHE.put(key, JSON.stringify(data), {
+      expirationTtl: 24 * 60 * 60  // Keep for 24 hours
+    });
+  } catch (e) {
+    console.error("Error tracking line movement:", e.message);
+  }
+}
+
+async function checkLineMovement(env, marketSlug) {
+  try {
+    // Fetch recent trades and find ones for this market
+    const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=500`);
+    if (!tradesRes.ok) return null;
+    
+    const trades = await tradesRes.json();
+    
+    // Find trades for this market
+    const marketTrades = trades.filter(t => 
+      t.slug === marketSlug || 
+      t.eventSlug === marketSlug ||
+      (t.slug && t.slug.includes(marketSlug)) ||
+      (marketSlug && marketSlug.includes(t.slug))
+    );
+    
+    if (marketTrades.length === 0) return null;
+    
+    // Get most recent trade price
+    marketTrades.sort((a, b) => b.timestamp - a.timestamp);
+    const latestTrade = marketTrades[0];
+    const currentPrice = parseFloat(latestTrade.price);
+    
+    return { currentPrice, market: latestTrade };
+  } catch (e) {
+    console.error("Error checking line movement:", e.message);
+    return null;
+  }
+}
+
+async function updateLineMovements(env) {
+  if (!env.SIGNALS_CACHE) return { updated: 0, confirmed: 0 };
+  
+  const results = { updated: 0, confirmed: 0, total: 0 };
+  
+  try {
+    // Get pending signals to check line movement
+    const pendingSignals = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+    
+    for (const signalId of pendingSignals.slice(0, 20)) {  // Check first 20
+      const lineKey = KV_LINE_MOVEMENT_PREFIX + signalId;
+      const lineData = await env.SIGNALS_CACHE.get(lineKey, { type: "json" });
+      
+      if (!lineData) continue;
+      
+      results.total++;
+      const elapsed = Date.now() - lineData.trackedAt;
+      const minutes = elapsed / (1000 * 60);
+      
+      // Check current price
+      const priceCheck = await checkLineMovement(env, lineData.marketSlug);
+      if (!priceCheck) continue;
+      
+      const currentPrice = priceCheck.currentPrice * 100;  // Convert to percentage
+      const entryPrice = lineData.entryPrice;
+      
+      // Update price snapshots based on elapsed time
+      let updated = false;
+      if (minutes >= 5 && !lineData.priceAfter5min) {
+        lineData.priceAfter5min = currentPrice;
+        updated = true;
+      }
+      if (minutes >= 30 && !lineData.priceAfter30min) {
+        lineData.priceAfter30min = currentPrice;
+        updated = true;
+      }
+      if (minutes >= 60 && !lineData.priceAfter1hr) {
+        lineData.priceAfter1hr = currentPrice;
+        updated = true;
+      }
+      if (minutes >= 120 && !lineData.priceAfter2hr) {
+        lineData.priceAfter2hr = currentPrice;
+        updated = true;
+      }
+      
+      // Calculate movement percentage
+      const latestPrice = lineData.priceAfter2hr || lineData.priceAfter1hr || 
+                          lineData.priceAfter30min || lineData.priceAfter5min || currentPrice;
+      
+      // For YES bets, positive movement = price went up
+      // For NO bets, positive movement = price went down
+      const direction = lineData.direction?.toLowerCase();
+      let movement;
+      if (direction === "yes" || direction === "over") {
+        movement = latestPrice - entryPrice;
+      } else {
+        movement = entryPrice - latestPrice;
+      }
+      
+      lineData.movementPct = Math.round(movement * 10) / 10;
+      lineData.confirmed = movement > 2;  // Line moved 2%+ in our direction
+      
+      if (updated) {
+        await env.SIGNALS_CACHE.put(lineKey, JSON.stringify(lineData), {
+          expirationTtl: 24 * 60 * 60
+        });
+        results.updated++;
+        if (lineData.confirmed) results.confirmed++;
+      }
+    }
+  } catch (e) {
+    console.error("Error updating line movements:", e.message);
+  }
+  
+  return results;
+}
+
+// Get line movement score bonus for a signal
+async function getLineMovementBonus(env, signalId) {
+  if (!env.SIGNALS_CACHE) return { bonus: 0, movement: null };
+  
+  try {
+    const lineKey = KV_LINE_MOVEMENT_PREFIX + signalId;
+    const lineData = await env.SIGNALS_CACHE.get(lineKey, { type: "json" });
+    
+    if (!lineData || lineData.movementPct === null) {
+      return { bonus: 0, movement: null };
+    }
+    
+    const movement = lineData.movementPct;
+    
+    if (movement >= 10) {
+      return { bonus: SCORES.LINE_MOVE_STRONG, movement, label: "📈 Line moved +10%!" };
+    } else if (movement >= 5) {
+      return { bonus: SCORES.LINE_MOVE_MODERATE, movement, label: "📈 Line moved +5%" };
+    } else if (movement >= 2) {
+      return { bonus: SCORES.LINE_MOVE_SLIGHT, movement, label: "📈 Line confirming" };
+    } else if (movement <= -5) {
+      return { bonus: -10, movement, label: "📉 Line moving against" };
+    }
+    
+    return { bonus: 0, movement };
+  } catch (e) {
+    return { bonus: 0, movement: null };
+  }
+}
+
+// SHARP VS PUBLIC DETECTION
+// Analyze if whales are betting opposite of small bettors
+function analyzeSharpVsPublic(trades) {
+  if (!trades || trades.length < 5) return null;
+  
+  const WHALE_THRESHOLD = 5000;
+  const SMALL_THRESHOLD = 500;
+  
+  let whaleVolumeYes = 0;
+  let whaleVolumeNo = 0;
+  let publicVolumeYes = 0;
+  let publicVolumeNo = 0;
+  let whaleCount = 0;
+  let publicCount = 0;
+  
+  for (const trade of trades) {
+    const amount = trade._usdValue || parseFloat(trade.usd_value) || 0;
+    const outcome = (trade.outcome || "").toLowerCase();
+    const isYes = outcome === "yes" || outcome.includes("over");
+    
+    if (amount >= WHALE_THRESHOLD) {
+      whaleCount++;
+      if (isYes) {
+        whaleVolumeYes += amount;
+      } else {
+        whaleVolumeNo += amount;
+      }
+    } else if (amount <= SMALL_THRESHOLD && amount > 0) {
+      publicCount++;
+      if (isYes) {
+        publicVolumeYes += amount;
+      } else {
+        publicVolumeNo += amount;
+      }
+    }
+  }
+  
+  if (whaleCount < 1 || publicCount < 3) return null;
+  
+  const whaleTotalVolume = whaleVolumeYes + whaleVolumeNo;
+  const publicTotalVolume = publicVolumeYes + publicVolumeNo;
+  
+  if (whaleTotalVolume < WHALE_THRESHOLD || publicTotalVolume < 1000) return null;
+  
+  // Calculate direction preferences
+  const whaleYesPct = whaleTotalVolume > 0 ? (whaleVolumeYes / whaleTotalVolume) * 100 : 50;
+  const publicYesPct = publicTotalVolume > 0 ? (publicVolumeYes / publicTotalVolume) * 100 : 50;
+  
+  // Check for divergence: whales heavily one way, public heavily the other
+  const divergence = Math.abs(whaleYesPct - publicYesPct);
+  
+  if (divergence >= 40) {
+    // Strong divergence - whales vs public
+    const whaleDirection = whaleYesPct > 50 ? "YES" : "NO";
+    const publicDirection = publicYesPct > 50 ? "YES" : "NO";
+    
+    return {
+      detected: true,
+      divergence: Math.round(divergence),
+      whaleDirection,
+      whaleVolume: Math.round(whaleTotalVolume),
+      whaleYesPct: Math.round(whaleYesPct),
+      publicDirection,
+      publicVolume: Math.round(publicTotalVolume),
+      publicYesPct: Math.round(publicYesPct),
+      whaleCount,
+      publicCount,
+      bonus: divergence >= 60 ? SCORES.SHARP_VS_PUBLIC : SCORES.SMART_MONEY_FADE,
+      label: `🎯 Sharp vs Public: Whales ${whaleDirection} (${Math.round(whaleYesPct)}%), Public ${publicDirection} (${Math.round(publicYesPct)}%)`
+    };
+  }
+  
+  return null;
+}
+
+// APPLY LEARNED FACTOR WEIGHTS TO SCORING
+async function applyLearnedWeights(env, baseScore, factors) {
+  if (!env.SIGNALS_CACHE || !factors || factors.length === 0) {
+    return baseScore;
+  }
+  
+  try {
+    const factorStats = await env.SIGNALS_CACHE.get(KV_KEYS.FACTOR_STATS, { type: "json" }) || {};
+    
+    // Calculate weighted adjustment
+    let totalWeight = 0;
+    let weightedSum = 0;
+    
+    for (const factor of factors) {
+      const stats = factorStats[factor];
+      if (stats && stats.wins + stats.losses >= 10) {  // Need minimum sample size
+        const weight = stats.weight || 1.0;
+        totalWeight += 1;
+        weightedSum += weight;
+      }
+    }
+    
+    if (totalWeight === 0) return baseScore;
+    
+    // Calculate average weight multiplier
+    const avgWeight = weightedSum / totalWeight;
+    
+    // Apply multiplier (capped between 0.7 and 1.5)
+    const cappedMultiplier = Math.max(0.7, Math.min(1.5, avgWeight));
+    
+    return Math.round(baseScore * cappedMultiplier);
+  } catch (e) {
+    console.error("Error applying learned weights:", e.message);
+    return baseScore;
+  }
+}
+
+// GET WALLET TIER BONUS/PENALTY FOR SCORING
+async function getWalletTierMultiplier(env, walletAddresses) {
+  if (!env.SIGNALS_CACHE || !walletAddresses || walletAddresses.length === 0) {
+    return { multiplier: 1.0, bestTier: null, bestWallet: null };
+  }
+  
+  let bestMultiplier = 1.0;
+  let bestTier = null;
+  let bestWallet = null;
+  let worstMultiplier = 1.0;
+  let fadeWallet = null;
+  
+  try {
+    for (const wallet of walletAddresses) {
+      const stats = await getWalletStats(env, wallet);
+      if (!stats || !stats.tierInfo) continue;
+      
+      const tier = stats.tierInfo.tier;
+      const multiplier = stats.tierInfo.scoreBoost;
+      
+      // Track best performer
+      if (tier === "ELITE" || tier === "STRONG") {
+        if (multiplier > bestMultiplier) {
+          bestMultiplier = multiplier;
+          bestTier = tier;
+          bestWallet = wallet;
+        }
+      }
+      
+      // Track worst performer (FADE)
+      if (tier === "FADE" && multiplier < worstMultiplier) {
+        worstMultiplier = multiplier;
+        fadeWallet = wallet;
+      }
+    }
+    
+    // If we have a FADE wallet, that takes precedence (we want to fade bad bettors)
+    if (fadeWallet && worstMultiplier < 1.0) {
+      return { 
+        multiplier: worstMultiplier, 
+        bestTier: "FADE", 
+        bestWallet: fadeWallet,
+        label: `🚫 FADE ALERT: Known losing wallet`
+      };
+    }
+    
+    if (bestTier) {
+      const emoji = bestTier === "ELITE" ? "🏆" : "💪";
+      return {
+        multiplier: bestMultiplier,
+        bestTier,
+        bestWallet,
+        label: `${emoji} ${bestTier} wallet involved`
+      };
+    }
+    
+    return { multiplier: 1.0, bestTier: null, bestWallet: null };
+  } catch (e) {
+    console.error("Error getting wallet tier:", e.message);
+    return { multiplier: 1.0, bestTier: null, bestWallet: null };
+  }
+}
+
+// GET STREAK BONUS FOR HOT/COLD WALLETS
+async function getStreakBonus(env, walletAddresses) {
+  if (!env.SIGNALS_CACHE || !walletAddresses || walletAddresses.length === 0) {
+    return { bonus: 0, streak: null, wallet: null };
+  }
+  
+  let bestStreak = 0;
+  let streakWallet = null;
+  
+  try {
+    for (const wallet of walletAddresses) {
+      const stats = await getWalletStats(env, wallet);
+      if (!stats) continue;
+      
+      const streak = stats.currentStreak || 0;
+      
+      if (Math.abs(streak) > Math.abs(bestStreak)) {
+        bestStreak = streak;
+        streakWallet = wallet;
+      }
+    }
+    
+    if (bestStreak >= 5) {
+      return {
+        bonus: SCORES.HOT_STREAK_BONUS,
+        streak: bestStreak,
+        wallet: streakWallet,
+        label: `🔥 ${bestStreak} win streak!`
+      };
+    } else if (bestStreak <= -5) {
+      return {
+        bonus: SCORES.COLD_STREAK_PENALTY,
+        streak: bestStreak,
+        wallet: streakWallet,
+        label: `❄️ ${Math.abs(bestStreak)} loss streak - fade?`
+      };
+    }
+    
+    return { bonus: 0, streak: bestStreak, wallet: streakWallet };
+  } catch (e) {
+    return { bonus: 0, streak: null, wallet: null };
+  }
+}
+
+// ============================================================
+// PHASE 3: INTELLIGENCE & AUTO-OPTIMIZATION
+// ============================================================
+
+// CONFIDENCE SCORE CALCULATION
+// Based on historical accuracy of factors + wallet track record
+async function calculateConfidence(env, factors, walletAddresses, score) {
+  if (!env.SIGNALS_CACHE) {
+    return { confidence: 50, level: "MEDIUM", factors: [] };
+  }
+  
+  try {
+    const factorStats = await env.SIGNALS_CACHE.get(KV_KEYS.FACTOR_STATS, { type: "json" }) || {};
+    
+    let totalSamples = 0;
+    let weightedWinRate = 0;
+    const factorConfidence = [];
+    
+    // Calculate confidence from factors
+    for (const factor of factors) {
+      const stats = factorStats[factor];
+      if (stats && (stats.wins + stats.losses) >= 5) {
+        const samples = stats.wins + stats.losses;
+        const winRate = stats.winRate;
+        totalSamples += samples;
+        weightedWinRate += winRate * samples;
+        
+        factorConfidence.push({
+          factor,
+          winRate,
+          samples,
+          weight: stats.weight
+        });
+      }
+    }
+    
+    // Get wallet confidence
+    let walletConfidence = 50;
+    let bestWalletWinRate = null;
+    for (const wallet of walletAddresses.slice(0, 5)) {
+      const stats = await getWalletStats(env, wallet);
+      if (stats && stats.totalBets >= 5) {
+        if (!bestWalletWinRate || stats.winRate > bestWalletWinRate) {
+          bestWalletWinRate = stats.winRate;
+          walletConfidence = stats.winRate;
+        }
+      }
+    }
+    
+    // Calculate overall confidence
+    let confidence;
+    if (totalSamples > 0) {
+      const factorAvgWinRate = weightedWinRate / totalSamples;
+      // Blend factor confidence with wallet confidence (60/40 split)
+      confidence = Math.round(factorAvgWinRate * 0.6 + walletConfidence * 0.4);
+    } else {
+      // No factor data yet, use wallet confidence or base on score
+      confidence = bestWalletWinRate || Math.min(70, 40 + score / 5);
+    }
+    
+    // Determine confidence level
+    let level;
+    let emoji;
+    if (confidence >= 75) {
+      level = "VERY HIGH";
+      emoji = "🔥";
+    } else if (confidence >= 65) {
+      level = "HIGH";
+      emoji = "✅";
+    } else if (confidence >= 55) {
+      level = "MEDIUM";
+      emoji = "📊";
+    } else if (confidence >= 45) {
+      level = "LOW";
+      emoji = "⚠️";
+    } else {
+      level = "VERY LOW";
+      emoji = "❌";
+    }
+    
+    return {
+      confidence,
+      level,
+      emoji,
+      label: `${emoji} ${confidence}% confidence (${level})`,
+      factorBreakdown: factorConfidence,
+      walletWinRate: bestWalletWinRate,
+      totalHistoricalSamples: totalSamples
+    };
+  } catch (e) {
+    console.error("Error calculating confidence:", e.message);
+    return { confidence: 50, level: "MEDIUM", factors: [] };
+  }
+}
+
+// WALLET SPECIALIZATION ANALYSIS
+// Find what markets a wallet is best/worst at
+async function getWalletSpecialization(env, walletAddress) {
+  if (!env.SIGNALS_CACHE || !walletAddress) return null;
+  
+  try {
+    const stats = await getWalletStats(env, walletAddress);
+    if (!stats || !stats.markets) return null;
+    
+    const specializations = [];
+    
+    for (const [marketType, data] of Object.entries(stats.markets)) {
+      const totalBets = data.wins + data.losses;
+      if (totalBets >= 3) {  // Need minimum sample
+        specializations.push({
+          marketType,
+          wins: data.wins,
+          losses: data.losses,
+          winRate: data.winRate,
+          totalBets,
+          edge: data.winRate - 50  // How much better than 50%
+        });
+      }
+    }
+    
+    // Sort by edge (best to worst)
+    specializations.sort((a, b) => b.edge - a.edge);
+    
+    const bestAt = specializations.filter(s => s.edge > 10);
+    const worstAt = specializations.filter(s => s.edge < -10);
+    
+    return {
+      address: walletAddress,
+      overallWinRate: stats.winRate,
+      totalBets: stats.totalBets,
+      specializations,
+      bestAt: bestAt.length > 0 ? bestAt[0] : null,
+      worstAt: worstAt.length > 0 ? worstAt[worstAt.length - 1] : null,
+      recommendation: bestAt.length > 0 
+        ? `Strong at ${bestAt.map(s => s.marketType).join(", ")}`
+        : "No clear specialization yet"
+    };
+  } catch (e) {
+    console.error("Error getting wallet specialization:", e.message);
+    return null;
+  }
+}
+
+// CHECK IF THIS IS A FADE OPPORTUNITY
+// When a known losing wallet bets big, we might want to bet the opposite
+async function checkFadeOpportunity(env, walletAddresses, direction, betAmount) {
+  if (!env.SIGNALS_CACHE || betAmount < 10000) return null;
+  
+  try {
+    for (const wallet of walletAddresses) {
+      const stats = await getWalletStats(env, wallet);
+      if (!stats) continue;
+      
+      // Check if this is a known losing wallet with enough history
+      if (stats.totalBets >= 10 && stats.winRate <= 40) {
+        const oppositeDirection = direction.toLowerCase() === "yes" ? "NO" : "YES";
+        
+        return {
+          isFade: true,
+          fadeWallet: wallet,
+          walletWinRate: stats.winRate,
+          walletRecord: `${stats.wins}W-${stats.losses}L`,
+          currentStreak: stats.currentStreak,
+          originalDirection: direction,
+          fadeDirection: oppositeDirection,
+          betAmount,
+          confidence: Math.round(100 - stats.winRate),  // Inverse of their win rate
+          label: `🚨 FADE ALERT: Losing wallet (${stats.winRate}%) bet ${direction}. Consider ${oppositeDirection}!`,
+          reasoning: `This wallet has a ${stats.winRate}% win rate over ${stats.totalBets} bets. ` +
+                    `They're betting ${direction}. Historical data suggests betting ${oppositeDirection} may be profitable.`
+        };
+      }
+    }
+    
+    return null;
+  } catch (e) {
+    console.error("Error checking fade opportunity:", e.message);
+    return null;
+  }
+}
+
+// AUTO-OPTIMIZE SCORING WEIGHTS
+// Periodically recalculate optimal weights based on outcomes
+async function optimizeFactorWeights(env) {
+  if (!env.SIGNALS_CACHE) return { optimized: false };
+  
+  try {
+    const factorStats = await env.SIGNALS_CACHE.get(KV_KEYS.FACTOR_STATS, { type: "json" }) || {};
+    
+    const optimizations = [];
+    let totalOptimized = 0;
+    
+    for (const [factor, stats] of Object.entries(factorStats)) {
+      const totalBets = stats.wins + stats.losses;
+      if (totalBets < 15) continue;  // Need enough data
+      
+      const winRate = stats.winRate;
+      const oldWeight = stats.weight;
+      
+      // Calculate new weight based on performance
+      // Base weight is 1.0, adjusted by win rate performance
+      // 50% win rate = 1.0 weight
+      // 70% win rate = 1.4 weight
+      // 30% win rate = 0.6 weight
+      let newWeight = 0.4 + (winRate / 100) * 1.2;
+      
+      // Apply smoothing (don't change too drastically)
+      newWeight = oldWeight * 0.7 + newWeight * 0.3;
+      
+      // Clamp to reasonable range
+      newWeight = Math.max(0.3, Math.min(2.5, newWeight));
+      newWeight = Math.round(newWeight * 100) / 100;
+      
+      if (Math.abs(newWeight - oldWeight) > 0.05) {
+        stats.weight = newWeight;
+        stats.previousWeight = oldWeight;
+        stats.optimizedAt = new Date().toISOString();
+        totalOptimized++;
+        
+        optimizations.push({
+          factor,
+          winRate,
+          samples: totalBets,
+          oldWeight,
+          newWeight,
+          change: Math.round((newWeight - oldWeight) * 100) / 100
+        });
+      }
+    }
+    
+    if (totalOptimized > 0) {
+      await env.SIGNALS_CACHE.put(KV_KEYS.FACTOR_STATS, JSON.stringify(factorStats));
+    }
+    
+    return {
+      optimized: true,
+      totalFactors: Object.keys(factorStats).length,
+      totalOptimized,
+      optimizations
+    };
+  } catch (e) {
+    console.error("Error optimizing weights:", e.message);
+    return { optimized: false, error: e.message };
+  }
+}
+
+// GET LEARNING SYSTEM INSIGHTS
+// Summary of what the system has learned
+async function getLearningInsights(env) {
+  if (!env.SIGNALS_CACHE) return null;
+  
+  try {
+    const factorStats = await env.SIGNALS_CACHE.get(KV_KEYS.FACTOR_STATS, { type: "json" }) || {};
+    const pendingSignals = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+    
+    // Analyze factors
+    const factorAnalysis = [];
+    let totalWins = 0;
+    let totalLosses = 0;
+    
+    for (const [factor, stats] of Object.entries(factorStats)) {
+      totalWins += stats.wins || 0;
+      totalLosses += stats.losses || 0;
+      
+      if ((stats.wins + stats.losses) >= 5) {
+        factorAnalysis.push({
+          factor,
+          winRate: stats.winRate,
+          wins: stats.wins,
+          losses: stats.losses,
+          weight: stats.weight,
+          performance: stats.winRate >= 60 ? "STRONG" : stats.winRate >= 50 ? "AVERAGE" : "WEAK"
+        });
+      }
+    }
+    
+    // Sort by win rate
+    factorAnalysis.sort((a, b) => b.winRate - a.winRate);
+    
+    // Identify best and worst factors
+    const bestFactors = factorAnalysis.filter(f => f.winRate >= 60).slice(0, 5);
+    const worstFactors = factorAnalysis.filter(f => f.winRate < 45).slice(-5).reverse();
+    
+    // Overall system performance
+    const overallWinRate = totalWins + totalLosses > 0 
+      ? Math.round((totalWins / (totalWins + totalLosses)) * 100) 
+      : 0;
+    
+    return {
+      systemPerformance: {
+        totalSignalsProcessed: totalWins + totalLosses,
+        wins: totalWins,
+        losses: totalLosses,
+        winRate: overallWinRate,
+        pendingSignals: pendingSignals.length
+      },
+      insights: {
+        bestFactors,
+        worstFactors,
+        recommendation: bestFactors.length > 0 
+          ? `Focus on signals with: ${bestFactors.map(f => f.factor).join(", ")}`
+          : "Need more data to generate recommendations"
+      },
+      allFactors: factorAnalysis
+    };
+  } catch (e) {
+    console.error("Error getting learning insights:", e.message);
+    return null;
+  }
+}
+
+// GENERATE SMART ALERT MESSAGE
+// Create intelligent alert with confidence and context
+async function generateSmartAlert(env, signal) {
+  const factors = [];
+  
+  // Extract factors from breakdown
+  for (const key of Object.keys(signal.scoreBreakdown || {})) {
+    if (key.includes("whale") || key.includes("Whale")) factors.push("whaleSize");
+    if (key.includes("Fresh") || key.includes("fresh")) factors.push("freshWallet");
+    if (key.includes("Last-minute") || key.includes("last-minute")) factors.push("lastMinute");
+    if (key.includes("Concentrated")) factors.push("concentrated");
+    if (key.includes("ELITE") || key.includes("STRONG")) factors.push("eliteWallet");
+    if (key.includes("Sharp")) factors.push("sharpVsPublic");
+    if (key.includes("streak")) factors.push("streak");
+  }
+  
+  // Get confidence
+  const wallets = signal.topTrades?.map(t => t.wallet).filter(Boolean) || [];
+  const confidence = await calculateConfidence(env, factors, wallets, signal.score);
+  
+  // Check for fade opportunity
+  const fadeCheck = await checkFadeOpportunity(env, wallets, signal.direction, signal.largestBet);
+  
+  // Build smart message
+  let message = `🚨 SIGNAL: ${signal.marketTitle}\n`;
+  message += `${signal.direction} @ ${signal.avgEntryPrice}%\n`;
+  message += `Score: ${signal.score} | ${confidence.label}\n`;
+  message += `Bet: $${signal.largestBet.toLocaleString()}\n`;
+  
+  if (fadeCheck && fadeCheck.isFade) {
+    message += `\n⚠️ FADE CONSIDERATION:\n${fadeCheck.reasoning}\n`;
+  }
+  
+  if (confidence.walletWinRate && confidence.walletWinRate >= 65) {
+    message += `\n🏆 Top wallet: ${confidence.walletWinRate}% win rate`;
+  }
+  
+  return {
+    message,
+    confidence,
+    fadeOpportunity: fadeCheck,
+    factors
+  };
+}
+
+var POLITICAL_KEYWORDS = ["election", "trump", "biden", "president", "senate", "congress", "governor", "republican", "democrat", "vote", "primary", "inauguration", "impeach", "pardon", "executive order", "cabinet", "nominee"];
+var CRYPTO_KEYWORDS = ["bitcoin", "btc", "ethereum", "eth", "crypto", "sec", "etf", "regulation", "gensler", "solana", "sol", "doge", "xrp"];
+var SPORTS_KEYWORDS = ["nba", "nfl", "mlb", "nhl", "super bowl", "championship", "playoffs", "world series", "mvp"];
+
+var corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
+// Filter out short-term gambling/speculation markets
+function isShortTermGamblingMarket(title) {
+  if (!title) return false;
+  const lowerTitle = title.toLowerCase();
+  
+  const gamblingPatterns = [
+    /up or down/i,
+    /will.*(?:btc|bitcoin|eth|ethereum|sol|solana|xrp|doge).*(?:above|below|higher|lower).*(?:at|by)\s*\d/i,
+    /\d{1,2}:\d{2}\s*(?:am|pm)?\s*[-–to]+\s*\d{1,2}:\d{2}\s*(?:am|pm)/i,
+    /(?:\d+\s*)?(?:minute|min|hour|hr)\s*(?:candle|close|window)/i,
+    /price.*(?:at|by)\s*\d{1,2}:\d{2}/i,
+    /hourly\s*(?:close|high|low|price)/i,
+  ];
+  
+  for (const pattern of gamblingPatterns) {
+    if (pattern.test(lowerTitle)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+// Extract event date from title or slug - returns Date object or null
+// Used for calculating time until event for last-minute whale scoring
+function getEventDate(title, slug) {
+  const now = new Date();
+  
+  // Try to extract date from slug (format: 2026-01-21)
+  const slugDateMatch = (slug || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (slugDateMatch) {
+    const eventYear = parseInt(slugDateMatch[1]);
+    const eventMonth = parseInt(slugDateMatch[2]) - 1;
+    const eventDay = parseInt(slugDateMatch[3]);
+    // Assume event is at 7pm EST = midnight UTC (next day technically, but close enough)
+    // 7pm EST = 00:00 UTC next day, so we use 23:59 UTC same day as a safe approximation
+    // This means we assume games end by midnight UTC
+    return new Date(Date.UTC(eventYear, eventMonth, eventDay, 23, 59, 0));
+  }
+  
+  // Try to extract date from title
+  const titleText = title || '';
+  const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 
+                      'july', 'august', 'september', 'october', 'november', 'december',
+                      'jan', 'feb', 'mar', 'apr', 'may', 'jun', 
+                      'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+  
+  const titleDateMatch = titleText.toLowerCase().match(
+    new RegExp(`(${monthNames.join('|')})\\s+(\\d{1,2})(?:,?\\s+(\\d{4}))?`, 'i')
+  );
+  
+  if (titleDateMatch) {
+    const monthStr = titleDateMatch[1].toLowerCase();
+    const day = parseInt(titleDateMatch[2]);
+    const year = titleDateMatch[3] ? parseInt(titleDateMatch[3]) : now.getFullYear();
+    
+    let month;
+    const fullMonthIndex = monthNames.slice(0, 12).indexOf(monthStr);
+    const shortMonthIndex = monthNames.slice(12).indexOf(monthStr);
+    if (fullMonthIndex !== -1) {
+      month = fullMonthIndex;
+    } else if (shortMonthIndex !== -1) {
+      month = shortMonthIndex;
+    } else {
+      return null;
+    }
+    
+    // Assume event ends by midnight UTC
+    return new Date(Date.UTC(year, month, day, 23, 59, 0));
+  }
+  
+  // Check for ISO date in title
+  const isoDateMatch = titleText.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (isoDateMatch) {
+    return new Date(
+      parseInt(isoDateMatch[1]),
+      parseInt(isoDateMatch[2]) - 1,
+      parseInt(isoDateMatch[3]),
+      19, 0, 0
+    );
+  }
+  
+  return null;
+}
+
+// ============================================
+// WALLET WIN RATE TRACKING
+// ============================================
+
+// Fetch wallet's resolved bets and calculate win rate
+async function getWalletWinRate(walletAddress, env) {
+  // Check cache first
+  if (env.SIGNALS_CACHE) {
+    try {
+      const cacheKey = `wallet_stats:${walletAddress}`;
+      const cached = await env.SIGNALS_CACHE.get(cacheKey, { type: "json" });
+      if (cached && cached.cachedAt) {
+        const cacheAge = (Date.now() - cached.cachedAt) / (1000 * 60 * 60);
+        if (cacheAge < WALLET_TRACK_RECORD.CACHE_HOURS) {
+          return cached;
+        }
+      }
+    } catch (e) {
+      console.log("Cache read error for wallet stats:", e.message);
+    }
+  }
+  
+  // Use the more accurate PnL calculation for win rate
+  try {
+    const pnlResult = await getWalletPnL(walletAddress);
+    
+    if (!pnlResult || !pnlResult.success) {
+      return null;
+    }
+    
+    const { summary } = pnlResult;
+    
+    const stats = {
+      walletAddress,
+      wins: summary.winCount,
+      losses: summary.lossCount,
+      totalResolved: summary.winCount + summary.lossCount,
+      winRate: summary.winRate,
+      totalWinnings: summary.totalWins,
+      totalLost: summary.totalLosses,
+      profitLoss: summary.realizedPnL,
+      meetsMinimum: (summary.winCount + summary.lossCount) >= WALLET_TRACK_RECORD.MIN_BETS,
+      cachedAt: Date.now(),
+      recentBets: pnlResult.resolvedBets?.slice(0, 10) || []
+    };
+    
+    // Cache the results
+    if (env.SIGNALS_CACHE) {
+      try {
+        const cacheKey = `wallet_stats:${walletAddress}`;
+        await env.SIGNALS_CACHE.put(cacheKey, JSON.stringify(stats), {
+          expirationTtl: 60 * 60 * WALLET_TRACK_RECORD.CACHE_HOURS
+        });
+      } catch (e) {
+        console.log("Cache write error for wallet stats:", e.message);
+      }
+    }
+    
+    return stats;
+  } catch (error) {
+    console.log("Error fetching wallet win rate:", error.message);
+    return null;
+  }
+}
+
+// Get win rate bonus score for a wallet
+function getWinRateBonus(walletStats) {
+  if (!walletStats || !walletStats.meetsMinimum) {
+    return { bonus: 0, tier: null };
+  }
+  
+  const winRate = walletStats.winRate;
+  
+  if (winRate >= 70) {
+    return { bonus: SCORES.PROVEN_WINNER_ELITE, tier: 'ELITE', winRate };
+  } else if (winRate >= 65) {
+    return { bonus: SCORES.PROVEN_WINNER_STRONG, tier: 'STRONG', winRate };
+  } else if (winRate >= 60) {
+    return { bonus: SCORES.PROVEN_WINNER_GOOD, tier: 'GOOD', winRate };
+  } else if (winRate >= 55) {
+    return { bonus: SCORES.PROVEN_WINNER_EDGE, tier: 'EDGE', winRate };
+  }
+  
+  return { bonus: 0, tier: null, winRate };
+}
+
+// Check if event has already started based on date in title or slug
+function hasEventStarted(title, slug, avgPrice) {
+  const now = Date.now();
+  
+  // Calculate EST time (UTC - 5 hours)
+  const EST_OFFSET = -5 * 60 * 60 * 1000;
+  const estNow = new Date(now + EST_OFFSET);
+  const currentHourEST = estNow.getUTCHours();
+  
+  // Get today's date in EST as YYYY-MM-DD string
+  const todayYear = estNow.getUTCFullYear();
+  const todayMonth = estNow.getUTCMonth() + 1;
+  const todayDay = estNow.getUTCDate();
+  const todayStr = `${todayYear}-${String(todayMonth).padStart(2, '0')}-${String(todayDay).padStart(2, '0')}`;
+  
+  // If odds are extreme (>95% or <5%), event is likely decided/in-progress
+  // Lowered threshold from 97/3 to catch more resolved games
+  if (avgPrice > 0.95 || avgPrice < 0.05) {
+    return true;
+  }
+  
+  // Try to extract date from slug (format: 2026-01-22)
+  const slugDateMatch = (slug || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (slugDateMatch) {
+    const eventYear = parseInt(slugDateMatch[1]);
+    const eventMonth = parseInt(slugDateMatch[2]);
+    const eventDay = parseInt(slugDateMatch[3]);
+    
+    // Compare just the date portions as strings (YYYY-MM-DD)
+    const eventDateStr = `${eventYear}-${String(eventMonth).padStart(2, '0')}-${String(eventDay).padStart(2, '0')}`;
+    
+    // If event date is before today, it has definitely ended
+    if (eventDateStr < todayStr) {
+      return true;
+    }
+    
+    // For same-day events, use time-based heuristics
+    if (eventDateStr === todayStr) {
+      // Sports events typically:
+      // - NCAA/NBA games: Usually 2-3 hours long, start in afternoon/evening
+      // - NFL games: 3-4 hours
+      // 
+      // If it's after 6pm EST and odds are somewhat directional (>75% or <25%), 
+      // the game is likely in progress or finished
+      if (currentHourEST >= 18 && (avgPrice > 0.75 || avgPrice < 0.25)) {
+        return true;
+      }
+      
+      // After 10pm EST with any directional odds = likely over
+      if (currentHourEST >= 22 && (avgPrice > 0.65 || avgPrice < 0.35)) {
+        return true;
+      }
+      
+      // After 11pm EST = most US sports are done
+      if (currentHourEST >= 23) {
+        return true;
+      }
+    }
+  }
+  
+  return false;
+}
+
+export default {
+  // HTTP request handler
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+    
+    try {
+      if (path === "/scan" || path === "/api/scan") {
+        const hours = parseInt(url.searchParams.get("hours") || "48");
+        const minScore = parseInt(url.searchParams.get("minScore") || "40");
+        const result = await runScan(hours, minScore, env);
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      if (path.startsWith("/wallet/") && path.includes("/positions")) {
+        const address = path.split("/")[2];
+        const result = await getWalletPositions(address);
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      if (path.startsWith("/wallet/") && path.includes("/pnl")) {
+        const address = path.split("/")[2];
+        const result = await getWalletPnL(address);
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Wallet win rate endpoint
+      if (path.startsWith("/wallet/") && path.includes("/winrate")) {
+        const address = path.split("/")[2];
+        const result = await getWalletWinRate(address, env);
+        if (result) {
+          const bonus = getWinRateBonus(result);
+          return new Response(JSON.stringify({
+            ...result,
+            scoreBonus: bonus.bonus,
+            tier: bonus.tier
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        return new Response(JSON.stringify({ error: "Could not fetch wallet data" }), {
+          status: 404,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      if (path.startsWith("/wallet/")) {
+        const address = path.split("/").pop();
+        const result = await getWalletDetails(address);
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Send SMS alert endpoint
+      if (path === "/send-alert" && request.method === "POST") {
+        const body = await request.json();
+        const result = await sendSMSAlert(body, env);
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Debug endpoint - shows ALL signals and filtering stats
+      if (path === "/debug" || path === "/debug-scan") {
+        const hours = parseInt(url.searchParams.get("hours") || "24");
+        const minScore = parseInt(url.searchParams.get("minScore") || "0"); // Default to 0 to see everything
+        const result = await runScan(hours, minScore, env, true); // true = debug mode
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Test SMS endpoint (for verifying setup)
+      if (path === "/test-sms") {
+        const phone = url.searchParams.get("phone");
+        if (!phone) {
+          return new Response(JSON.stringify({ error: "Phone number required" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        const result = await sendSMS(phone, "🚨 Polymarket Scanner test alert! Your SMS notifications are working.", env);
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Subscribe to alerts endpoint (POST)
+      if (path === "/alerts/subscribe" && request.method === "POST") {
+        const body = await request.json();
+        const result = await subscribeToAlerts(body, env);
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Easy subscribe via GET (just use URL params)
+      if (path === "/alerts/subscribe" && request.method === "GET") {
+        const phone = url.searchParams.get("phone");
+        const minScore = parseInt(url.searchParams.get("minScore") || "100");
+        const minBet = parseInt(url.searchParams.get("minBet") || "20000");
+        const categories = url.searchParams.get("categories")?.split(",") || ["all"];
+        
+        if (!phone) {
+          return new Response(JSON.stringify({ error: "Phone number required. Use: /alerts/subscribe?phone=+1XXXXXXXXXX" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        const result = await subscribeToAlerts({ phone, minScore, minBet, categories }, env);
+        return new Response(JSON.stringify(result), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Get alert subscribers (for admin)
+      if (path === "/alerts/subscribers") {
+        const subscribers = await getAlertSubscribers(env);
+        return new Response(JSON.stringify(subscribers), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Clear cache endpoint (use after scoring changes)
+      if (path === "/clear-cache") {
+        if (env.SIGNALS_CACHE) {
+          try {
+            await env.SIGNALS_CACHE.delete("signals");
+            return new Response(JSON.stringify({ 
+              success: true, 
+              message: "Cache cleared. Next scan will rebuild with fresh scores." 
+            }), {
+              headers: { ...corsHeaders, "Content-Type": "application/json" }
+            });
+          } catch (e) {
+            return new Response(JSON.stringify({ success: false, error: e.message }), {
+              status: 500,
+              headers: { ...corsHeaders, "Content-Type": "application/json" }
+            });
+          }
+        }
+        return new Response(JSON.stringify({ success: false, error: "No cache configured" }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // ============================================
+      // LEARNING SYSTEM ENDPOINTS
+      // ============================================
+      
+      // Get learning stats overview
+      if (path === "/learning/stats") {
+        if (!env.SIGNALS_CACHE) {
+          return new Response(JSON.stringify({ error: "No cache configured" }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        try {
+          const factorStats = await env.SIGNALS_CACHE.get(KV_KEYS.FACTOR_STATS, { type: "json" }) || {};
+          const pendingSignals = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+          
+          // Calculate overall stats
+          let totalWins = 0;
+          let totalLosses = 0;
+          for (const stats of Object.values(factorStats)) {
+            totalWins += stats.wins || 0;
+            totalLosses += stats.losses || 0;
+          }
+          
+          return new Response(JSON.stringify({
+            success: true,
+            overview: {
+              totalFactorsTracked: Object.keys(factorStats).length,
+              totalSignalsProcessed: totalWins + totalLosses,
+              overallWinRate: totalWins + totalLosses > 0 
+                ? Math.round((totalWins / (totalWins + totalLosses)) * 100) 
+                : 0,
+              pendingSignals: pendingSignals.length
+            },
+            factors: factorStats
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+      }
+      
+      // Get tracked wallet stats
+      if (path.startsWith("/learning/wallet/")) {
+        const address = path.split("/")[3];
+        if (!address) {
+          return new Response(JSON.stringify({ error: "Wallet address required" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        const stats = await getWalletStats(env, address);
+        if (!stats) {
+          return new Response(JSON.stringify({ 
+            success: false, 
+            message: "Wallet not tracked yet. Stats will appear after placing significant bets." 
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        return new Response(JSON.stringify({ success: true, wallet: stats }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Get all elite/strong wallets (leaderboard)
+      if (path === "/learning/leaderboard") {
+        if (!env.SIGNALS_CACHE) {
+          return new Response(JSON.stringify({ error: "No cache configured" }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        try {
+          // First try to get wallets from the dedicated index (fast path)
+          let walletAddresses = await env.SIGNALS_CACHE.get("tracked_wallet_index", { type: "json" }) || [];
+          
+          // If index is empty, try building from pending signals (slower fallback)
+          if (walletAddresses.length === 0) {
+            const pendingIds = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+            const walletSet = new Set();
+            
+            // Fetch signals in parallel batches of 10
+            for (let i = 0; i < Math.min(pendingIds.length, 30); i += 10) {
+              const batch = pendingIds.slice(i, i + 10);
+              const results = await Promise.all(
+                batch.map(id => env.SIGNALS_CACHE.get(KV_KEYS.SIGNALS_PREFIX + id, { type: "json" }))
+              );
+              results.forEach(signalData => {
+                if (signalData?.wallets) {
+                  signalData.wallets.forEach(w => walletSet.add(w.toLowerCase()));
+                }
+              });
+            }
+            walletAddresses = Array.from(walletSet);
+          }
+          
+          // Fetch wallet stats in parallel batches
+          const walletStats = [];
+          for (let i = 0; i < walletAddresses.length; i += 10) {
+            const batch = walletAddresses.slice(i, i + 10);
+            const results = await Promise.all(
+              batch.map(addr => getWalletStats(env, addr))
+            );
+            results.forEach(stats => {
+              if (stats && stats.totalBets > 0) {
+                walletStats.push(stats);
+              }
+            });
+          }
+          
+          // Sort by win rate (minimum 3 bets), then by total bets
+          walletStats.sort((a, b) => {
+            const aQualified = a.totalBets >= 3;
+            const bQualified = b.totalBets >= 3;
+            if (aQualified && !bQualified) return -1;
+            if (!aQualified && bQualified) return 1;
+            if (a.winRate !== b.winRate) return b.winRate - a.winRate;
+            return b.totalBets - a.totalBets;
+          });
+          
+          // Calculate summary stats
+          const eliteCount = walletStats.filter(w => w.tier === 'ELITE').length;
+          const strongCount = walletStats.filter(w => w.tier === 'STRONG').length;
+          const totalWins = walletStats.reduce((sum, w) => sum + (w.wins || 0), 0);
+          const totalLosses = walletStats.reduce((sum, w) => sum + (w.losses || 0), 0);
+          const avgWinRate = totalWins + totalLosses > 0 
+            ? Math.round((totalWins / (totalWins + totalLosses)) * 100) 
+            : 0;
+          
+          return new Response(JSON.stringify({
+            success: true,
+            summary: {
+              eliteCount,
+              strongCount,
+              totalTracked: walletStats.length,
+              avgWinRate
+            },
+            tiers: WALLET_TIERS,
+            leaderboard: walletStats.slice(0, 50).map(w => ({
+              address: w.address,
+              tier: w.tier,
+              winRate: w.winRate,
+              record: `${w.wins}W-${w.losses}L`,
+              totalBets: w.totalBets,
+              pending: w.pending,
+              totalVolume: w.totalVolume,
+              avgBetSize: w.avgBetSize,
+              currentStreak: w.currentStreak,
+              bestStreak: w.bestStreak,
+              lastSeen: w.lastSeen,
+              markets: w.markets
+            }))
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+      }
+      
+      // Get ALL tracked wallets (for frontend Whale Watchers)
+      if (path === "/learning/tracked-wallets") {
+        if (!env.SIGNALS_CACHE) {
+          return new Response(JSON.stringify({ error: "No cache configured" }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        try {
+          // Try to get wallets from a dedicated index first
+          let trackedWallets = await env.SIGNALS_CACHE.get("tracked_wallet_index", { type: "json" }) || [];
+          
+          // Fetch wallet stats in parallel batches
+          const walletData = [];
+          for (let i = 0; i < Math.min(trackedWallets.length, 100); i += 10) {
+            const batch = trackedWallets.slice(i, i + 10);
+            const results = await Promise.all(
+              batch.map(addr => getWalletStats(env, addr))
+            );
+            results.forEach(stats => {
+              if (stats) {
+                walletData.push({
+                  address: stats.address,
+                  tier: stats.tier,
+                  winRate: stats.winRate,
+                  wins: stats.wins,
+                  losses: stats.losses,
+                  pending: stats.pending,
+                  totalVolume: stats.totalVolume,
+                  avgBetSize: stats.avgBetSize,
+                  currentStreak: stats.currentStreak,
+                  bestStreak: stats.bestStreak,
+                  lastSeen: stats.lastSeen,
+                  firstSeen: stats.firstSeen,
+                  markets: stats.markets,
+                  recentBets: stats.recentBets?.slice(0, 5) || []
+                });
+              }
+            });
+          }
+          
+          // Sort: ELITE first, then STRONG, then by win rate
+          walletData.sort((a, b) => {
+            const tierOrder = { ELITE: 0, STRONG: 1, AVERAGE: 2, FADE: 3, null: 4 };
+            const tierDiff = (tierOrder[a.tier] || 4) - (tierOrder[b.tier] || 4);
+            if (tierDiff !== 0) return tierDiff;
+            return b.winRate - a.winRate;
+          });
+          
+          return new Response(JSON.stringify({
+            success: true,
+            count: walletData.length,
+            wallets: walletData
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+      }
+      
+      // Manually trigger settlement check
+      if (path === "/learning/settle") {
+        const results = await processSettledSignals(env);
+        return new Response(JSON.stringify({
+          success: true,
+          results
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Debug: Check wallet index status
+      if (path === "/learning/debug-wallets") {
+        const walletIndex = await env.SIGNALS_CACHE.get("tracked_wallet_index", { type: "json" }) || [];
+        const pendingSignals = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+        
+        // Get a sample of wallet stats
+        const sampleStats = [];
+        for (const addr of walletIndex.slice(0, 5)) {
+          const stats = await getWalletStats(env, addr);
+          if (stats) sampleStats.push(stats);
+        }
+        
+        return new Response(JSON.stringify({
+          success: true,
+          walletIndexCount: walletIndex.length,
+          walletIndexSample: walletIndex.slice(0, 10),
+          pendingSignalsCount: pendingSignals.length,
+          sampleWalletStats: sampleStats
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Debug: Check settlement status for a specific signal
+      if (path === "/learning/debug-settle") {
+        const signalId = url.searchParams.get("id");
+        
+        if (!signalId) {
+          // If no ID provided, check first pending signal
+          const pendingIds = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+          if (pendingIds.length === 0) {
+            return new Response(JSON.stringify({ error: "No pending signals" }), {
+              status: 404,
+              headers: { ...corsHeaders, "Content-Type": "application/json" }
+            });
+          }
+          
+          // Also fetch trades to debug matching
+          let tradeSlugs = [];
+          try {
+            const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=100`);
+            if (tradesRes.ok) {
+              const trades = await tradesRes.json();
+              // Get unique slugs from trades
+              const slugSet = new Set();
+              trades.forEach(t => {
+                if (t.slug) slugSet.add(t.slug);
+                if (t.eventSlug) slugSet.add(t.eventSlug);
+              });
+              tradeSlugs = Array.from(slugSet).slice(0, 30);
+            }
+          } catch (e) {
+            tradeSlugs = ["Error fetching: " + e.message];
+          }
+          
+          // Check first 3 signals for debugging
+          const debugResults = [];
+          for (const id of pendingIds.slice(0, 3)) {
+            const signalData = await env.SIGNALS_CACHE.get(KV_KEYS.SIGNALS_PREFIX + id, { type: "json" });
+            if (signalData) {
+              const settlement = await checkMarketSettlement(signalData.marketSlug);
+              debugResults.push({
+                signalId: id,
+                marketSlug: signalData.marketSlug,
+                marketTitle: signalData.marketTitle,
+                direction: signalData.direction,
+                eventDate: signalData.eventDate,
+                settlement
+              });
+            }
+          }
+          
+          return new Response(JSON.stringify({
+            success: true,
+            pendingCount: pendingIds.length,
+            recentTradeSlugs: tradeSlugs,
+            debugResults
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        const signalData = await env.SIGNALS_CACHE.get(KV_KEYS.SIGNALS_PREFIX + signalId, { type: "json" });
+        if (!signalData) {
+          return new Response(JSON.stringify({ error: "Signal not found" }), {
+            status: 404,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        const settlement = await checkMarketSettlement(signalData.marketSlug);
+        
+        return new Response(JSON.stringify({
+          success: true,
+          signal: signalData,
+          settlement
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Debug: Test raw API responses for a slug
+      if (path === "/learning/debug-api") {
+        const slug = url.searchParams.get("slug") || "nba-was-cha-2026-01-24";
+        const apiResults = {};
+        
+        // Try events endpoint
+        try {
+          const eventRes = await fetch(`${POLYMARKET_API}/events/${slug}`);
+          apiResults.eventsEndpoint = {
+            status: eventRes.status,
+            ok: eventRes.ok,
+            data: eventRes.ok ? await eventRes.json() : null
+          };
+        } catch (e) {
+          apiResults.eventsEndpoint = { error: e.message };
+        }
+        
+        // Try markets endpoint
+        try {
+          const marketRes = await fetch(`${POLYMARKET_API}/markets/${slug}`);
+          apiResults.marketsEndpoint = {
+            status: marketRes.status,
+            ok: marketRes.ok,
+            data: marketRes.ok ? await marketRes.json() : null
+          };
+        } catch (e) {
+          apiResults.marketsEndpoint = { error: e.message };
+        }
+        
+        // Try markets query
+        try {
+          const queryRes = await fetch(`${POLYMARKET_API}/markets?slug=${slug}`);
+          apiResults.marketsQuery = {
+            status: queryRes.status,
+            ok: queryRes.ok,
+            data: queryRes.ok ? await queryRes.json() : null
+          };
+        } catch (e) {
+          apiResults.marketsQuery = { error: e.message };
+        }
+        
+        // Try events query
+        try {
+          const eventsQueryRes = await fetch(`${POLYMARKET_API}/events?slug=${slug}`);
+          apiResults.eventsQuery = {
+            status: eventsQueryRes.status,
+            ok: eventsQueryRes.ok,
+            data: eventsQueryRes.ok ? await eventsQueryRes.json() : null
+          };
+        } catch (e) {
+          apiResults.eventsQuery = { error: e.message };
+        }
+        
+        // Also get a sample trade to see data structure
+        try {
+          const tradeRes = await fetch(`${POLYMARKET_API}/trades?limit=1`);
+          if (tradeRes.ok) {
+            const trades = await tradeRes.json();
+            apiResults.sampleTrade = trades[0] || null;
+            
+            // If we got a trade, try to look up by conditionId
+            if (trades[0]?.conditionId) {
+              const conditionId = trades[0].conditionId;
+              
+              // Try market by conditionId
+              try {
+                const condRes = await fetch(`${POLYMARKET_API}/markets?conditionId=${conditionId}`);
+                apiResults.marketByConditionId = {
+                  status: condRes.status,
+                  ok: condRes.ok,
+                  data: condRes.ok ? await condRes.json() : null
+                };
+              } catch (e) {
+                apiResults.marketByConditionId = { error: e.message };
+              }
+              
+              // Try condition endpoint directly
+              try {
+                const condRes2 = await fetch(`${POLYMARKET_API}/conditions/${conditionId}`);
+                apiResults.conditionEndpoint = {
+                  status: condRes2.status,
+                  ok: condRes2.ok,
+                  data: condRes2.ok ? await condRes2.json() : null
+                };
+              } catch (e) {
+                apiResults.conditionEndpoint = { error: e.message };
+              }
+              
+              // Try prices endpoint
+              try {
+                const priceRes = await fetch(`${POLYMARKET_API}/prices?conditionId=${conditionId}`);
+                apiResults.pricesByConditionId = {
+                  status: priceRes.status,
+                  ok: priceRes.ok,
+                  data: priceRes.ok ? await priceRes.json() : null
+                };
+              } catch (e) {
+                apiResults.pricesByConditionId = { error: e.message };
+              }
+            }
+          }
+        } catch (e) {
+          apiResults.sampleTrade = { error: e.message };
+        }
+        
+        return new Response(JSON.stringify({
+          success: true,
+          testedSlug: slug,
+          apiResults
+        }, null, 2), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Get pending signals awaiting settlement
+      if (path === "/learning/pending") {
+        if (!env.SIGNALS_CACHE) {
+          return new Response(JSON.stringify({ error: "No cache configured" }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        try {
+          const pendingIds = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+          const pendingDetails = [];
+          
+          // Get details for first 20 pending signals
+          for (const id of pendingIds.slice(0, 20)) {
+            const signalData = await env.SIGNALS_CACHE.get(KV_KEYS.SIGNALS_PREFIX + id, { type: "json" });
+            if (signalData) {
+              pendingDetails.push({
+                id: signalData.id,
+                market: signalData.marketTitle,
+                direction: signalData.direction,
+                score: signalData.score,
+                eventDate: signalData.eventDate,
+                detectedAt: signalData.detectedAt
+              });
+            }
+          }
+          
+          return new Response(JSON.stringify({
+            success: true,
+            totalPending: pendingIds.length,
+            signals: pendingDetails
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+      }
+      
+      // PHASE 2: Get line movement data for signals
+      if (path === "/learning/lines") {
+        if (!env.SIGNALS_CACHE) {
+          return new Response(JSON.stringify({ error: "No cache configured" }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        try {
+          const pendingIds = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: "json" }) || [];
+          const lineData = [];
+          
+          for (const id of pendingIds.slice(0, 30)) {
+            const lineKey = KV_LINE_MOVEMENT_PREFIX + id;
+            const data = await env.SIGNALS_CACHE.get(lineKey, { type: "json" });
+            if (data) {
+              lineData.push({
+                signalId: data.signalId,
+                marketSlug: data.marketSlug,
+                direction: data.direction,
+                entryPrice: data.entryPrice,
+                priceAfter5min: data.priceAfter5min,
+                priceAfter30min: data.priceAfter30min,
+                priceAfter1hr: data.priceAfter1hr,
+                movementPct: data.movementPct,
+                confirmed: data.confirmed,
+                trackedAt: new Date(data.trackedAt).toISOString()
+              });
+            }
+          }
+          
+          // Sort by movement (confirmed first, then by movement %)
+          lineData.sort((a, b) => {
+            if (a.confirmed && !b.confirmed) return -1;
+            if (!a.confirmed && b.confirmed) return 1;
+            return (b.movementPct || 0) - (a.movementPct || 0);
+          });
+          
+          return new Response(JSON.stringify({
+            success: true,
+            totalTracked: lineData.length,
+            confirmedMoves: lineData.filter(l => l.confirmed).length,
+            lines: lineData
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+      }
+      
+      // PHASE 2: Manually trigger line movement update
+      if (path === "/learning/lines/update") {
+        const results = await updateLineMovements(env);
+        return new Response(JSON.stringify({
+          success: true,
+          results
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // ============================================
+      // PHASE 3: INTELLIGENCE ENDPOINTS
+      // ============================================
+      
+      // Get learning insights and recommendations
+      if (path === "/learning/insights") {
+        const insights = await getLearningInsights(env);
+        if (!insights) {
+          return new Response(JSON.stringify({ error: "Could not generate insights" }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        return new Response(JSON.stringify({
+          success: true,
+          ...insights
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Get wallet specialization
+      if (path.startsWith("/learning/specialization/")) {
+        const address = path.split("/")[3];
+        if (!address) {
+          return new Response(JSON.stringify({ error: "Wallet address required" }), {
+            status: 400,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        const specialization = await getWalletSpecialization(env, address);
+        if (!specialization) {
+          return new Response(JSON.stringify({ 
+            success: false, 
+            message: "Wallet not tracked or not enough data yet" 
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        return new Response(JSON.stringify({ success: true, ...specialization }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Manually trigger weight optimization
+      if (path === "/learning/optimize") {
+        const results = await optimizeFactorWeights(env);
+        return new Response(JSON.stringify({
+          success: true,
+          ...results
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      // Get fade alerts (signals where known losers are betting)
+      if (path === "/learning/fades") {
+        if (!env.SIGNALS_CACHE) {
+          return new Response(JSON.stringify({ error: "No cache configured" }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+        
+        try {
+          // Get recent signals and check for fade opportunities
+          const cached = await env.SIGNALS_CACHE.get("signals", { type: "json" }) || [];
+          const fadeSignals = cached.filter(s => s.fadeAlert && s.fadeAlert.isFade);
+          
+          return new Response(JSON.stringify({
+            success: true,
+            totalFades: fadeSignals.length,
+            fades: fadeSignals.slice(0, 20).map(s => ({
+              market: s.marketTitle,
+              originalDirection: s.direction,
+              fadeDirection: s.fadeAlert.fadeDirection,
+              losingWalletWinRate: s.fadeAlert.walletWinRate,
+              losingWalletRecord: s.fadeAlert.walletRecord,
+              confidence: s.fadeAlert.confidence,
+              betAmount: s.largestBet,
+              reasoning: s.fadeAlert.reasoning
+            }))
+          }), {
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        } catch (e) {
+          return new Response(JSON.stringify({ error: e.message }), {
+            status: 500,
+            headers: { ...corsHeaders, "Content-Type": "application/json" }
+          });
+        }
+      }
+      
+      if (path === "/health" || path === "/") {
+        // Get cache stats
+        let cacheStats = { signalCount: 0, oldestSignal: null, newestSignal: null };
+        if (env.SIGNALS_CACHE) {
+          try {
+            const cached = await env.SIGNALS_CACHE.get("signals", { type: "json" });
+            if (cached && Array.isArray(cached)) {
+              cacheStats.signalCount = cached.length;
+              if (cached.length > 0) {
+                const sorted = cached.sort((a, b) => new Date(a.firstTradeTime) - new Date(b.firstTradeTime));
+                cacheStats.oldestSignal = sorted[0]?.firstTradeTime;
+                cacheStats.newestSignal = sorted[sorted.length - 1]?.firstTradeTime;
+              }
+            }
+          } catch (e) {}
+        }
+        
+        return new Response(JSON.stringify({
+          status: "ok",
+          timestamp: new Date().toISOString(),
+          version: "16.3.0 - Optimized API + wallet tracking",
+          cache: cacheStats
+        }), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
+        });
+      }
+      
+      return new Response(JSON.stringify({ error: "Not found" }), {
+        status: 404,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({
+        error: error.message,
+        stack: error.stack
+      }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" }
+      });
+    }
+  },
+  
+  // Cron trigger handler - runs every 5 minutes
+  async scheduled(event, env, ctx) {
+    console.log("Cron triggered at:", new Date().toISOString());
+    try {
+      // Run scan with 48h window and low minScore to capture everything
+      const result = await runScan(48, 30, env);
+      console.log("Cron scan completed successfully");
+      
+      // Check for new high-value signals and send alerts
+      if (result.success && result.signals && result.signals.length > 0) {
+        // Only check signals that meet alert thresholds (score >= 100, bet >= $20k)
+        const alertableSignals = result.signals.filter(s => s.score >= 100 && s.largestBet >= 20000);
+        if (alertableSignals.length > 0) {
+          await checkAndSendAlerts(alertableSignals, env);
+          console.log(`Checked ${alertableSignals.length} signals for alerts`);
+        }
+      }
+      
+      // Run settlement checker to learn from outcomes
+      console.log("Running settlement checker...");
+      const settlementResults = await processSettledSignals(env);
+      console.log(`Settlement: ${settlementResults.processed} processed, ${settlementResults.wins}W-${settlementResults.losses}L`);
+      
+      // PHASE 2: Update line movements for active signals
+      console.log("Checking line movements...");
+      const lineResults = await updateLineMovements(env);
+      console.log(`Line movements: ${lineResults.updated} updated, ${lineResults.confirmed} confirmed`);
+      
+      // PHASE 3: Optimize factor weights periodically (every ~hour based on 5min cron)
+      // Only run if we've processed some signals
+      if (settlementResults.processed > 0) {
+        console.log("Optimizing factor weights...");
+        const optimizeResults = await optimizeFactorWeights(env);
+        console.log(`Optimization: ${optimizeResults.totalOptimized} factors updated`);
+      }
+      
+    } catch (error) {
+      console.error("Cron scan failed:", error.message);
+    }
+  }
+};
+
+async function runScan(hoursBack, minScore, env, debugMode = false) {
+  const now = Date.now();
+  const cutoffTime = now - hoursBack * 60 * 60 * 1000;
+  
+  // Fetch fresh trades from API - INCREASED LIMIT from 2000 to 5000
+  console.log("Fetching trades...");
+  const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=5000`);
+  if (!tradesRes.ok) throw new Error("Trades API error: " + tradesRes.status);
+  const allTrades = await tradesRes.json();
+  console.log(`Fetched ${allTrades.length} trades`);
+  
+  let debugCounts = {
+    tooOld: 0,
+    settlement: 0,
+    sureBet: 0,    // NEW: Track "sure bet" trades (odds too extreme to be meaningful)
+    tooSmall: 0,
+    gamblingMarket: 0,
+    passed: 0
+  };
+  
+  const gamblingMarketSamples = []; // Track some examples
+  const tradeSamples = []; // Track a few full trades for debugging
+  
+  const validTrades = allTrades.filter((t) => {
+    const marketTitle = t.title || t.market || '';
+    
+    // Track first 5 trades to see data structure
+    if (tradeSamples.length < 5) {
+      tradeSamples.push({
+        title: t.title,
+        market: t.market,
+        slug: t.slug,
+        outcome: t.outcome,
+        side: t.side,
+        usd_value: t.usd_value,
+        size: t.size,
+        price: t.price
+      });
+    }
+    
+    if (isShortTermGamblingMarket(marketTitle)) {
+      debugCounts.gamblingMarket++;
+      if (gamblingMarketSamples.length < 10) {
+        gamblingMarketSamples.push(marketTitle);
+      }
+      return false;
+    }
+    
+    let tradeTime = t.timestamp;
+    if (tradeTime && tradeTime < 1e10) {
+      tradeTime = tradeTime * 1000;
+    }
+    if (!tradeTime || tradeTime < cutoffTime) {
+      debugCounts.tooOld++;
+      return false;
+    }
+    t._tradeTime = tradeTime;
+    
+    const price = parseFloat(t.price) || 0;
+    
+    // Filter out settlement-level prices (basically resolved)
+    if (price >= 0.99 || price <= 0.01) {
+      debugCounts.settlement++;
+      return false;
+    }
+    
+    // NEW: Filter out "sure bet" trades - odds too extreme to be meaningful signals
+    // These inflate win rates because betting at 85%+ is almost guaranteed to win
+    // They're not real "alpha" - just risk-free money grabs
+    if (price >= 0.85 || price <= 0.15) {
+      debugCounts.sureBet++;
+      return false;
+    }
+    
+    let usdValue = parseFloat(t.usd_value) || 0;
+    if (!usdValue && t.size && t.price) {
+      usdValue = parseFloat(t.size) * parseFloat(t.price);
+    }
+    t._usdValue = usdValue;
+    
+    if (usdValue < 10) {
+      debugCounts.tooSmall++;
+      return false;
+    }
+    
+    debugCounts.passed++;
+    return true;
+  });
+  
+  console.log("Filter debug:", debugCounts);
+  
+  // Profile wallets - includes freshness AND win rate tracking
+  const uniqueWallets = [...new Set(validTrades.map((t) => t.proxyWallet || t.user || t.maker))].slice(0, 100);
+  const walletProfiles = {};
+  const walletWinRates = {}; // Track win rates separately for top wallets
+  
+  // First pass: get basic wallet profiles (freshness)
+  for (let i = 0; i < uniqueWallets.length; i += 10) {
+    const batch = uniqueWallets.slice(i, i + 10);
+    await Promise.all(batch.map(async (wallet) => {
+      try {
+        const res = await fetch(`${POLYMARKET_API}/activity?user=${wallet}&limit=20`);
+        if (res.ok) {
+          const activity = await res.json();
+          walletProfiles[wallet] = {
+            totalTrades: activity?.length || 0,
+            isFresh: (activity?.length || 0) < 10,
+            isVeryFresh: (activity?.length || 0) < 3
+          };
+        } else {
+          walletProfiles[wallet] = { totalTrades: 0, isFresh: true, isVeryFresh: true };
+        }
+      } catch (e) {
+        walletProfiles[wallet] = { totalTrades: 0, isFresh: true, isVeryFresh: true };
+      }
+    }));
+  }
+  
+  // Second pass: get win rates for wallets with WHALE-SIZED bets ($50k+)
+  // Only worth checking track record for serious money
+  const whaleWallets = [];
+  const walletLargestBet = {};
+  validTrades.forEach(t => {
+    const wallet = t.proxyWallet || t.user || t.maker;
+    walletLargestBet[wallet] = Math.max(walletLargestBet[wallet] || 0, t._usdValue);
+  });
+  
+  for (const [wallet, largestBet] of Object.entries(walletLargestBet)) {
+    // Only check win rate for wallets placing $50k+ single bets
+    if (largestBet >= 50000 && !walletProfiles[wallet]?.isFresh) {
+      whaleWallets.push({ wallet, largestBet });
+    }
+  }
+  
+  // Sort by largest bet and check top whales
+  whaleWallets.sort((a, b) => b.largestBet - a.largestBet);
+  const walletsToCheck = whaleWallets.slice(0, 20).map(w => w.wallet);
+  console.log(`Checking win rates for ${walletsToCheck.length} whale wallets ($50k+ bets)`);
+  
+  for (let i = 0; i < walletsToCheck.length; i += 5) {
+    const batch = walletsToCheck.slice(i, i + 5);
+    await Promise.all(batch.map(async (wallet) => {
+      try {
+        const winRateStats = await getWalletWinRate(wallet, env);
+        if (winRateStats) {
+          walletWinRates[wallet] = winRateStats;
+        }
+      } catch (e) {
+        console.log(`Error fetching win rate for ${wallet}:`, e.message);
+      }
+    }));
+  }
+  
+  console.log(`Fetched win rates for ${Object.keys(walletWinRates).length} wallets`);
+  
+  // Group trades by market+direction
+  const groups = {};
+  validTrades.forEach((t) => {
+    const marketKey = t.slug || t.eventSlug || t.conditionId;
+    // Use actual outcome from trade data, fallback to inferring from side
+    const direction = t.outcome || (t.side === "BUY" ? "Yes" : "No");
+    const key = `${marketKey}:${direction}`;
+    
+    if (!groups[key]) {
+      groups[key] = {
+        marketKey,
+        marketTitle: t.title || "Unknown Market",
+        marketSlug: t.slug || t.eventSlug,
+        marketIcon: t.icon,
+        direction,
+        trades: [],
+        wallets: new Set(),
+        totalVolume: 0,
+        largestBet: 0,
+        timestamps: []
+      };
+    }
+    
+    const wallet = t.proxyWallet || t.user || t.maker;
+    groups[key].trades.push(t);
+    groups[key].wallets.add(wallet);
+    groups[key].totalVolume += t._usdValue;
+    groups[key].largestBet = Math.max(groups[key].largestBet, t._usdValue);
+    groups[key].timestamps.push(t._tradeTime);
+  });
+  
+  console.log(`Groups to analyze: ${Object.keys(groups).length}`);
+  
+  // Score each group and create signals
+  const newSignals = [];
+  const debugGroups = []; // Track why groups don't become signals
+  
+  for (const [key, g] of Object.entries(groups)) {
+    if (isShortTermGamblingMarket(g.marketTitle)) {
+      continue;
+    }
+    
+    let score = 0;
+    const breakdown = {};
+    const numWallets = g.wallets.size;
+    const avgBetPerWallet = g.totalVolume / numWallets;
+    
+    // Calculate wallet volume distribution for concentration scoring
+    const walletVolumes = {};
+    let largestFreshWalletBet = 0;
+    let freshWalletCount = 0;
+    let freshWalletVolume = 0;
+    
+    g.trades.forEach((t) => {
+      const wallet = t.proxyWallet || t.user || t.maker;
+      walletVolumes[wallet] = (walletVolumes[wallet] || 0) + t._usdValue;
+      
+      const profile = walletProfiles[wallet];
+      if (profile?.isFresh) {
+        freshWalletCount++;
+        freshWalletVolume += t._usdValue;
+        largestFreshWalletBet = Math.max(largestFreshWalletBet, t._usdValue);
+      }
+    });
+    
+    // Sort wallets by volume and get individual bet sizes
+    const walletVolumeEntries = Object.entries(walletVolumes).sort((a, b) => b[1] - a[1]);
+    const sortedWalletVolumes = walletVolumeEntries.map(e => e[1]);
+    const topWalletVolume = sortedWalletVolumes[0] || 0;
+    const secondWalletVolume = sortedWalletVolumes[1] || 0;
+    const top2WalletsVolume = sortedWalletVolumes.slice(0, 2).reduce((a, b) => a + b, 0);
+    
+    // Check if largest bet is from a fresh wallet (for either/or logic)
+    const isLargestBetFresh = largestFreshWalletBet >= g.largestBet * 0.95; // Within 5%
+    
+    // ============================================
+    // WHALE BET SIZE OR FRESH WALLET (one or the other, not both)
+    // ============================================
+    if (isLargestBetFresh && largestFreshWalletBet >= 50000) {
+      score += SCORES.FRESH_WHALE_HUGE;
+      breakdown[`🚨 Fresh wallet WHALE ($${Math.round(largestFreshWalletBet / 1000)}k)`] = SCORES.FRESH_WHALE_HUGE;
+    } else if (isLargestBetFresh && largestFreshWalletBet >= 25000) {
+      score += SCORES.FRESH_WHALE_LARGE;
+      breakdown[`🚨 Fresh wallet large ($${Math.round(largestFreshWalletBet / 1000)}k)`] = SCORES.FRESH_WHALE_LARGE;
+    } else if (isLargestBetFresh && largestFreshWalletBet >= 10000) {
+      score += SCORES.FRESH_WHALE_NOTABLE;
+      breakdown[`⚠️ Fresh wallet ($${Math.round(largestFreshWalletBet / 1000)}k)`] = SCORES.FRESH_WHALE_NOTABLE;
+    } else if (isLargestBetFresh && largestFreshWalletBet >= 5000) {
+      score += SCORES.FRESH_WHALE_MEDIUM;
+      breakdown[`Fresh wallet ($${Math.round(largestFreshWalletBet / 1000)}k)`] = SCORES.FRESH_WHALE_MEDIUM;
+    } else if (isLargestBetFresh && largestFreshWalletBet >= 2000) {
+      score += SCORES.FRESH_WALLET_SMALL;
+      breakdown[`Fresh wallet ($${Math.round(largestFreshWalletBet / 1000)}k)`] = SCORES.FRESH_WALLET_SMALL;
+    } else if (g.largestBet >= 50000) {
+      // Not fresh - use regular whale scoring
+      score += SCORES.WHALE_BET_MASSIVE;
+      breakdown[`🐋 Massive whale ($${Math.round(g.largestBet / 1000)}k)`] = SCORES.WHALE_BET_MASSIVE;
+    } else if (g.largestBet >= 25000) {
+      score += SCORES.WHALE_BET_LARGE;
+      breakdown[`🐋 Large whale ($${Math.round(g.largestBet / 1000)}k)`] = SCORES.WHALE_BET_LARGE;
+    } else if (g.largestBet >= 15000) {
+      score += SCORES.WHALE_BET_NOTABLE;
+      breakdown[`🐋 Notable bet ($${Math.round(g.largestBet / 1000)}k)`] = SCORES.WHALE_BET_NOTABLE;
+    } else if (g.largestBet >= 8000) {
+      score += SCORES.WHALE_BET_MEDIUM;
+      breakdown[`Solid bet ($${Math.round(g.largestBet / 1000)}k)`] = SCORES.WHALE_BET_MEDIUM;
+    } else if (g.largestBet >= 3000) {
+      score += SCORES.WHALE_BET_SMALL;
+      breakdown[`Notable bet ($${Math.round(g.largestBet / 1000)}k)`] = SCORES.WHALE_BET_SMALL;
+    }
+    
+    // ============================================
+    // CONCENTRATION (few wallets controlling action)
+    // ============================================
+    const topWalletPct = topWalletVolume / g.totalVolume;
+    const top2Pct = top2WalletsVolume / g.totalVolume;
+    
+    // Single whale concentration: 1 wallet has >80% AND bet $10k+
+    if (numWallets <= 2 && topWalletPct >= 0.80 && topWalletVolume >= 10000) {
+      score += SCORES.CONCENTRATION_SINGLE_WHALE;
+      breakdown[`🎯 Concentrated (${Math.round(topWalletPct * 100)}% from 1 wallet)`] = SCORES.CONCENTRATION_SINGLE_WHALE;
+    } 
+    // Whale duo: 2 wallets have >80% AND both bet $5k+
+    else if (numWallets === 2 && top2Pct >= 0.80 && topWalletVolume >= 5000 && secondWalletVolume >= 5000) {
+      score += SCORES.CONCENTRATION_WHALE_DUO;
+      breakdown[`🎯 Whale duo (both $5k+)`] = SCORES.CONCENTRATION_WHALE_DUO;
+    }
+    // High concentration with decent bet
+    else if (topWalletPct >= 0.60 && topWalletVolume >= 5000) {
+      score += SCORES.CONCENTRATION_HIGH;
+      breakdown[`🎯 Concentrated (${Math.round(topWalletPct * 100)}%)`] = SCORES.CONCENTRATION_HIGH;
+    }
+    
+    // ============================================
+    // PROVEN WINNER WALLET (track record - THE HOLY GRAIL)
+    // ============================================
+    let bestWinRateBonus = { bonus: 0, tier: null };
+    let bestWinRateWallet = null;
+    const provenWinners = [];
+    
+    // Check win rates for wallets in this signal
+    for (const wallet of g.wallets) {
+      const winRateStats = walletWinRates[wallet];
+      if (winRateStats) {
+        const winRateBonus = getWinRateBonus(winRateStats);
+        if (winRateBonus.bonus > 0) {
+          provenWinners.push({
+            wallet,
+            winRate: winRateStats.winRate,
+            totalBets: winRateStats.totalResolved,
+            tier: winRateBonus.tier
+          });
+          if (winRateBonus.bonus > bestWinRateBonus.bonus) {
+            bestWinRateBonus = winRateBonus;
+            bestWinRateWallet = wallet;
+          }
+        }
+      }
+    }
+    
+    if (bestWinRateBonus.bonus > 0) {
+      score += bestWinRateBonus.bonus;
+      const tierEmoji = bestWinRateBonus.tier === 'ELITE' ? '🏆' : 
+                        bestWinRateBonus.tier === 'STRONG' ? '⭐' : 
+                        bestWinRateBonus.tier === 'GOOD' ? '✅' : '📈';
+      breakdown[`${tierEmoji} Proven winner (${bestWinRateBonus.winRate}% win rate)`] = bestWinRateBonus.bonus;
+      
+      // Extra bonus if whale bet comes from proven winner
+      if (g.largestBet >= 15000 && bestWinRateBonus.tier) {
+        score += SCORES.WHALE_PROVEN_WINNER;
+        breakdown[`💎 Whale + proven winner combo`] = SCORES.WHALE_PROVEN_WINNER;
+      }
+    }
+    
+    // ============================================
+    // COORDINATED (multiple wallets betting together)
+    // ============================================
+    if (numWallets >= 3 && g.timestamps.length >= 3) {
+      const sortedTimes = [...g.timestamps].sort((a, b) => a - b);
+      const timeSpan = sortedTimes[sortedTimes.length - 1] - sortedTimes[0];
+      const twoHours = 2 * 60 * 60 * 1000;
+      
+      if (timeSpan <= twoHours) {
+        // Check if ALL wallets are betting decent amounts
+        const minBetInGroup = Math.min(...sortedWalletVolumes.slice(0, numWallets));
+        
+        if (minBetInGroup >= 5000) {
+          score += SCORES.COORDINATED_WHALES;
+          breakdown[`🔗 Coordinated (${numWallets} wallets, ALL $5k+)`] = SCORES.COORDINATED_WHALES;
+        } else if (minBetInGroup >= 2000) {
+          score += SCORES.COORDINATED_LARGE;
+          breakdown[`Coordinated (${numWallets} wallets, ALL $2k+)`] = SCORES.COORDINATED_LARGE;
+        }
+      }
+    }
+    
+    // ============================================
+    // VOLUME
+    // ============================================
+    if (g.totalVolume >= 100000) {
+      score += SCORES.VOLUME_MASSIVE;
+      breakdown[`Volume >$100k`] = SCORES.VOLUME_MASSIVE;
+    } else if (g.totalVolume >= 50000) {
+      score += SCORES.VOLUME_LARGE;
+      breakdown[`Volume >$50k`] = SCORES.VOLUME_LARGE;
+    } else if (g.totalVolume >= 25000) {
+      score += SCORES.VOLUME_NOTABLE;
+      breakdown[`Volume >$25k`] = SCORES.VOLUME_NOTABLE;
+    } else if (g.totalVolume >= 10000) {
+      score += SCORES.VOLUME_MEDIUM;
+      breakdown[`Volume >$10k`] = SCORES.VOLUME_MEDIUM;
+    }
+    
+    // ============================================
+    // RAPID ACCUMULATION
+    // ============================================
+    const sortedTimes = [...g.timestamps].sort((a, b) => a - b);
+    const timeSpan = sortedTimes[sortedTimes.length - 1] - sortedTimes[0];
+    const thirtyMinutes = 30 * 60 * 1000;
+    
+    if (timeSpan <= thirtyMinutes && g.totalVolume >= 10000) {
+      score += SCORES.RAPID_ACCUMULATION;
+      breakdown[`Rapid ($${Math.round(g.totalVolume / 1000)}k in ${Math.round(timeSpan / 60000)}min)`] = SCORES.RAPID_ACCUMULATION;
+    }
+    
+    // ============================================
+    // MARKET TYPE (minor factor)
+    // ============================================
+    const marketText = (g.marketTitle || "").toLowerCase();
+    if (POLITICAL_KEYWORDS.some((k) => marketText.includes(k))) {
+      score += SCORES.POLITICAL;
+      breakdown["Political market"] = SCORES.POLITICAL;
+    } else if (SPORTS_KEYWORDS.some((k) => marketText.includes(k))) {
+      score += SCORES.SPORTS;
+      breakdown["Sports market"] = SCORES.SPORTS;
+    } else if (CRYPTO_KEYWORDS.some((k) => marketText.includes(k))) {
+      score += SCORES.CRYPTO;
+      breakdown["Crypto market"] = SCORES.CRYPTO;
+    }
+    
+    // ============================================
+    // EXTREME ODDS (betting on long shots or heavy favorites)
+    // ============================================
+    const avgPrice = g.trades.reduce((sum, t) => sum + parseFloat(t.price || 0), 0) / g.trades.length;
+    if ((avgPrice < 0.15 || avgPrice > 0.85) && g.largestBet >= 2000) {
+      score += SCORES.EXTREME_ODDS;
+      breakdown[`Extreme odds (${Math.round(avgPrice * 100)}%)`] = SCORES.EXTREME_ODDS;
+    } else if ((avgPrice < 0.25 || avgPrice > 0.75) && g.largestBet >= 3000) {
+      score += SCORES.MODERATE_ODDS;
+      breakdown[`Strong odds (${Math.round(avgPrice * 100)}%)`] = SCORES.MODERATE_ODDS;
+    }
+    
+    // ============================================
+    // LAST-MINUTE BETTING (close to event)
+    // ============================================
+    const eventDate = getEventDate(g.marketTitle, g.marketSlug);
+    if (eventDate && g.largestBet >= 10000) {
+      const lastTradeTimestamp = Math.max(...g.timestamps);
+      const hoursUntilEvent = (eventDate.getTime() - lastTradeTimestamp) / (1000 * 60 * 60);
+      
+      // Only apply if event is in the future
+      if (hoursUntilEvent > 0 && hoursUntilEvent <= 12) {
+        if (hoursUntilEvent <= 2) {
+          score += SCORES.LAST_MINUTE_WHALE_2H;
+          breakdown[`⏰ Last-minute (${hoursUntilEvent.toFixed(1)}h before)`] = SCORES.LAST_MINUTE_WHALE_2H;
+        } else if (hoursUntilEvent <= 6) {
+          score += SCORES.LAST_MINUTE_WHALE_6H;
+          breakdown[`⏰ Pre-event (${hoursUntilEvent.toFixed(1)}h before)`] = SCORES.LAST_MINUTE_WHALE_6H;
+        } else if (hoursUntilEvent <= 12) {
+          score += SCORES.LAST_MINUTE_WHALE_12H;
+          breakdown[`⏰ Same-day (${hoursUntilEvent.toFixed(1)}h before)`] = SCORES.LAST_MINUTE_WHALE_12H;
+        }
+      }
+    }
+    
+    // ============================================
+    // PHASE 2: SHARP VS PUBLIC DIVERGENCE
+    // ============================================
+    const sharpVsPublic = analyzeSharpVsPublic(g.trades);
+    if (sharpVsPublic && sharpVsPublic.detected) {
+      score += sharpVsPublic.bonus;
+      breakdown[sharpVsPublic.label] = sharpVsPublic.bonus;
+    }
+    
+    // ============================================
+    // PHASE 2: WALLET TIER SCORING
+    // ============================================
+    const walletAddresses = Array.from(g.wallets);
+    const tierInfo = await getWalletTierMultiplier(env, walletAddresses);
+    
+    // Store original score before multiplier
+    const baseScore = score;
+    
+    if (tierInfo.multiplier !== 1.0 && tierInfo.bestTier) {
+      // Apply tier multiplier
+      score = Math.round(score * tierInfo.multiplier);
+      if (tierInfo.multiplier > 1.0) {
+        breakdown[tierInfo.label] = `x${tierInfo.multiplier} multiplier`;
+      } else {
+        breakdown[tierInfo.label] = `x${tierInfo.multiplier} (caution!)`;
+      }
+    }
+    
+    // ============================================
+    // PHASE 2: HOT/COLD STREAK BONUS
+    // ============================================
+    const streakInfo = await getStreakBonus(env, walletAddresses);
+    if (streakInfo.bonus !== 0) {
+      score += streakInfo.bonus;
+      breakdown[streakInfo.label] = streakInfo.bonus;
+    }
+    
+    // Skip events that have already started
+    if (hasEventStarted(g.marketTitle, g.marketSlug, avgPrice)) {
+      debugGroups.push({
+        market: g.marketTitle,
+        reason: 'hasEventStarted',
+        largestBet: Math.round(g.largestBet),
+        volume: Math.round(g.totalVolume),
+        score
+      });
+      continue;
+    }
+    
+    // Track groups that don't meet score threshold
+    if (score < 15) {
+      debugGroups.push({
+        market: g.marketTitle,
+        reason: `score ${score} < 15`,
+        largestBet: Math.round(g.largestBet),
+        volume: Math.round(g.totalVolume),
+        score,
+        breakdown
+      });
+    }
+    
+    // Store signals with score >= 15
+    if (score >= 15) {
+      const sortedTimes = [...g.timestamps].sort((a, b) => a - b);
+      const firstTradeTime = new Date(sortedTimes[0]);
+      const lastTradeTime = new Date(sortedTimes[sortedTimes.length - 1]);
+      const avgEntry = Math.round(avgPrice * 100);
+      
+      // Calculate hours until event for display
+      const eventDateForSignal = getEventDate(g.marketTitle, g.marketSlug);
+      let hoursUntilEvent = null;
+      if (eventDateForSignal) {
+        hoursUntilEvent = Math.round((eventDateForSignal.getTime() - Date.now()) / (1000 * 60 * 60) * 10) / 10;
+        if (hoursUntilEvent < 0) hoursUntilEvent = null; // Event passed
+      }
+      
+      const signal = {
+        id: `${g.marketSlug}:${g.direction}:${sortedTimes[0]}`,
+        marketTitle: g.marketTitle,
+        marketSlug: g.marketSlug,
+        marketUrl: `https://polymarket.com/market/${g.marketSlug}`,
+        marketIcon: g.marketIcon,
+        direction: g.direction,
+        currentPrice: avgEntry,
+        avgEntryPrice: avgEntry,
+        suspiciousVolume: Math.round(g.totalVolume),
+        numWallets,
+        numTrades: g.trades.length,
+        largestBet: Math.round(g.largestBet),
+        freshWallets: freshWalletCount,
+        score,
+        scoreBreakdown: breakdown,
+        firstTradeTime: firstTradeTime.toISOString(),
+        lastTradeTime: lastTradeTime.toISOString(),
+        eventDate: eventDateForSignal ? eventDateForSignal.toISOString() : null,
+        hoursUntilEvent: hoursUntilEvent,
+        provenWinners: provenWinners.length > 0 ? provenWinners : null,
+        bestWinRate: bestWinRateBonus.winRate || null,
+        detectedAt: new Date().toISOString(),
+        topTrades: g.trades.sort((a, b) => b._usdValue - a._usdValue).slice(0, 5).map((t) => {
+          const wallet = t.proxyWallet || t.user || t.maker;
+          const profile = walletProfiles[wallet];
+          const winRateStats = walletWinRates[wallet];
+          return {
+            wallet: wallet || "",
+            amount: Math.round(t._usdValue),
+            price: Math.round(parseFloat(t.price || 0) * 100),
+            time: new Date(t._tradeTime).toISOString(),
+            isFresh: profile?.isFresh || false,
+            winRate: winRateStats?.meetsMinimum ? winRateStats.winRate : null,
+            totalBets: winRateStats?.totalResolved || null
+          };
+        })
+      };
+      
+      // ============================================
+      // PHASE 3: CONFIDENCE & FADE DETECTION
+      // ============================================
+      
+      // Extract factors for learning
+      const factors = [];
+      if (freshWalletCount > 0 && g.largestBet >= 2000) factors.push("freshWallet");
+      if (g.largestBet >= 50000) factors.push("whaleSize50k");
+      else if (g.largestBet >= 25000) factors.push("whaleSize25k");
+      else if (g.largestBet >= 15000) factors.push("whaleSize15k");
+      if (hoursUntilEvent && hoursUntilEvent <= 2) factors.push("lastMinute2h");
+      else if (hoursUntilEvent && hoursUntilEvent <= 6) factors.push("lastMinute6h");
+      if (breakdown["🎯 Concentrated (100% from 1 wallet)"] || breakdown["🎯 Concentrated (90%)"]) factors.push("concentrated");
+      if (breakdown["🔗 Coordinated (3+ wallets, ALL $5k+)"] || breakdown["Coordinated (3+ wallets, ALL $2k+)"]) factors.push("coordinated");
+      if (avgEntry >= 85 || avgEntry <= 15) factors.push("extremeOdds");
+      if (sharpVsPublic && sharpVsPublic.detected) factors.push("sharpVsPublic");
+      if (tierInfo.bestTier === "ELITE") factors.push("eliteWallet");
+      if (tierInfo.bestTier === "STRONG") factors.push("strongWallet");
+      
+      const marketType = detectMarketType(g.marketTitle);
+      if (marketType === "political") factors.push("politicalMarket");
+      if (marketType === "sports") factors.push("sportsMarket");
+      if (marketType === "crypto") factors.push("cryptoMarket");
+      
+      // Get wallet addresses involved
+      const involvedWallets = Array.from(g.wallets).slice(0, 10);
+      
+      // Calculate confidence (Phase 3)
+      const confidence = await calculateConfidence(env, factors, involvedWallets, score);
+      signal.confidence = confidence.confidence;
+      signal.confidenceLevel = confidence.level;
+      signal.confidenceLabel = confidence.label;
+      
+      // Check for fade opportunity (Phase 3)
+      const fadeCheck = await checkFadeOpportunity(env, involvedWallets, g.direction, g.largestBet);
+      if (fadeCheck && fadeCheck.isFade) {
+        signal.fadeAlert = {
+          isFade: true,
+          fadeDirection: fadeCheck.fadeDirection,
+          losingWallet: fadeCheck.fadeWallet,
+          walletWinRate: fadeCheck.walletWinRate,
+          walletRecord: fadeCheck.walletRecord,
+          confidence: fadeCheck.confidence,
+          reasoning: fadeCheck.reasoning
+        };
+        // Add to breakdown
+        breakdown[fadeCheck.label] = "⚠️ FADE";
+      }
+      
+      // Store signal for learning (async, don't await)
+      if (env.SIGNALS_CACHE && score >= 50) {
+        storeSignalForLearning(env, signal, factors, involvedWallets).catch(e => 
+          console.error("Error storing signal for learning:", e.message)
+        );
+        
+        // PHASE 2: Track line movement for this signal
+        trackLineMovement(env, g.marketSlug, g.direction, avgEntry, signal.id).catch(e =>
+          console.error("Error tracking line movement:", e.message)
+        );
+        
+        // Track wallets that placed significant bets ($1k+ for tracking purposes)
+        for (const trade of g.trades) {
+          if (trade._usdValue >= 1000) {
+            const wallet = trade.proxyWallet || trade.user || trade.maker;
+            if (wallet) {
+              updateWalletStats(env, wallet, {
+                signalId: signal.id,
+                market: g.marketTitle,
+                marketSlug: g.marketSlug,
+                direction: g.direction,
+                amount: trade._usdValue,
+                price: Math.round(parseFloat(trade.price || 0) * 100)
+              }).catch(e => console.error("Error updating wallet:", e.message));
+            }
+          }
+        }
+      }
+      
+      newSignals.push(signal);
+    }
+  }
+  
+  // Load cached signals from KV
+  let cachedSignals = [];
+  if (env.SIGNALS_CACHE) {
+    try {
+      const cached = await env.SIGNALS_CACHE.get("signals", { type: "json" });
+      if (cached && Array.isArray(cached)) {
+        cachedSignals = cached;
+      }
+    } catch (e) {
+      console.log("KV read error:", e.message);
+    }
+  }
+  
+  // Merge new signals with cached ones
+  const signalMap = new Map();
+  
+  // Add cached signals first
+  cachedSignals.forEach(s => {
+    signalMap.set(s.id, s);
+  });
+  
+  // Update/add new signals (new signals take priority)
+  newSignals.forEach(s => {
+    const existing = signalMap.get(s.id);
+    if (!existing || s.score > existing.score || s.suspiciousVolume > existing.suspiciousVolume) {
+      signalMap.set(s.id, s);
+    }
+  });
+  
+  // Convert back to array
+  let allSignals = Array.from(signalMap.values());
+  
+  // Filter out signals older than 7 days
+  const maxAge = 7 * 24 * 60 * 60 * 1000;
+  allSignals = allSignals.filter(s => {
+    const signalTime = new Date(s.firstTradeTime).getTime();
+    return (now - signalTime) < maxAge;
+  });
+  
+  // Save merged signals back to KV
+  if (env.SIGNALS_CACHE) {
+    try {
+      await env.SIGNALS_CACHE.put("signals", JSON.stringify(allSignals), {
+        expirationTtl: 60 * 60 * 24 * 7 // 7 days
+      });
+      console.log(`Saved ${allSignals.length} signals to KV`);
+    } catch (e) {
+      console.log("KV write error:", e.message);
+    }
+  }
+  
+  // Filter by requested time window
+  const filteredSignals = allSignals.filter(s => {
+    const signalTime = new Date(s.firstTradeTime).getTime();
+    return signalTime >= cutoffTime;
+  });
+  
+  // Filter out events that have already started (check cached signals too)
+  // This is a quick heuristic filter based on date/time
+  const activeSignals = filteredSignals.filter(s => {
+    return !hasEventStarted(s.marketTitle, s.marketSlug, s.avgEntryPrice / 100);
+  });
+  
+  // Additional filter: Check if market appears resolved based on current price
+  // If we have the current market price and it's at 99%+ or 1%-, market is resolved
+  const trulyActiveSignals = activeSignals.filter(s => {
+    // If currentPrice is at resolution levels, filter it out
+    const price = s.currentPrice || s.avgEntryPrice;
+    if (price >= 99 || price <= 1) {
+      console.log(`Filtering resolved market: ${s.marketTitle} (price: ${price}%)`);
+      return false;
+    }
+    
+    // Check if event date has passed (more thorough check)
+    const eventDate = getEventDate(s.marketTitle, s.marketSlug);
+    if (eventDate) {
+      const now = new Date();
+      // If event date + 6 hours has passed, filter it out
+      // This gives buffer for games to finish
+      const eventEndTime = new Date(eventDate.getTime() + 6 * 60 * 60 * 1000);
+      if (now > eventEndTime) {
+        console.log(`Filtering past event: ${s.marketTitle} (event: ${eventDate.toISOString()})`);
+        return false;
+      }
+    }
+    
+    return true;
+  });
+  
+  // Filter by min score and sort
+  const finalSignals = trulyActiveSignals
+    .filter(s => s.score >= minScore)
+    .sort((a, b) => b.score - a.score);
+  
+  // In debug mode, include all signals before score filtering
+  const debugAllSignals = debugMode ? trulyActiveSignals.sort((a, b) => b.score - a.score).map(s => ({
+    market: s.marketTitle,
+    score: s.score,
+    largestBet: s.largestBet,
+    volume: s.suspiciousVolume,
+    numWallets: s.numWallets,
+    freshWallets: s.freshWallets,
+    breakdown: s.scoreBreakdown,
+    filteredOut: s.score < minScore ? `Score ${s.score} < minScore ${minScore}` : null
+  })) : null;
+  
+  // Score distribution for debug
+  const scoreDistribution = debugMode ? {
+    '100+': trulyActiveSignals.filter(s => s.score >= 100).length,
+    '80-99': trulyActiveSignals.filter(s => s.score >= 80 && s.score < 100).length,
+    '60-79': trulyActiveSignals.filter(s => s.score >= 60 && s.score < 80).length,
+    '40-59': trulyActiveSignals.filter(s => s.score >= 40 && s.score < 60).length,
+    '20-39': trulyActiveSignals.filter(s => s.score >= 20 && s.score < 40).length,
+    '1-19': trulyActiveSignals.filter(s => s.score >= 1 && s.score < 20).length,
+    '0': trulyActiveSignals.filter(s => s.score === 0).length
+  } : null;
+  
+  // REMOVED: .slice(0, 50) - now returns ALL signals
+  return {
+    success: true,
+    scanTime: new Date().toISOString(),
+    hoursScanned: hoursBack,
+    totalSignals: finalSignals.length,
+    criticalCount: finalSignals.filter((s) => s.score >= 100).length,
+    highRiskCount: finalSignals.filter((s) => s.score >= 80 && s.score < 100).length,
+    mediumRiskCount: finalSignals.filter((s) => s.score >= 60 && s.score < 80).length,
+    totalSuspiciousVolume: finalSignals.reduce((sum, s) => sum + s.suspiciousVolume, 0),
+    signals: finalSignals,
+    _debug: {
+      filterCounts: debugCounts,
+      cutoffTime: new Date(cutoffTime).toISOString(),
+      currentTime: new Date(now).toISOString(),
+      totalTradesFetched: allTrades.length,
+      validTradesCount: validTrades.length,
+      groupsAnalyzed: Object.keys(groups).length,
+      walletsProfiled: Object.keys(walletProfiles).length,
+      cachedSignalsCount: cachedSignals.length,
+      newSignalsCount: newSignals.length,
+      mergedSignalsCount: allSignals.length,
+      filteredByTimeWindow: filteredSignals.length,
+      afterEventStartedFilter: activeSignals.length,
+      ...(debugMode && { 
+        scoreDistribution, 
+        allSignalsBeforeScoreFilter: debugAllSignals,
+        minScoreUsed: minScore,
+        groupsFiltered: debugGroups.slice(0, 30),
+        gamblingMarketSamples,
+        tradeSamples
+      })
+    }
+  };
+}
+
+async function getWalletDetails(address) {
+  try {
+    // Fetch activity with more results
+    const res = await fetch(`${POLYMARKET_API}/activity?user=${address}&limit=500`);
+    if (!res.ok) throw new Error("Wallet API error: " + res.status);
+    const activity = await res.json();
+    
+    if (!activity || activity.length === 0) {
+      return {
+        success: true,
+        profile: { totalTrades: 0, isFresh: true, totalVolume: 0 },
+        recentActivity: []
+      };
+    }
+    
+    // Filter to only TRADE types (not SPLIT, MERGE, REDEEM, etc.)
+    const trades = activity.filter(t => t.type === 'TRADE');
+    
+    // Calculate total volume using usdcSize (the correct field from API)
+    const totalVolume = trades.reduce((sum, t) => sum + (parseFloat(t.usdcSize) || 0), 0);
+    
+    // Get first seen date (oldest trade)
+    const sortedByTime = [...trades].sort((a, b) => a.timestamp - b.timestamp);
+    const firstSeen = sortedByTime.length > 0 ? sortedByTime[0].timestamp : null;
+    
+    // Format timestamp properly
+    const formatTimestamp = (ts) => {
+      if (!ts) return null;
+      // If timestamp is in seconds, convert to milliseconds
+      const msTimestamp = ts < 1e12 ? ts * 1000 : ts;
+      return new Date(msTimestamp).toISOString();
+    };
+    
+    return {
+      success: true,
+      profile: {
+        address: address,
+        totalTrades: trades.length,
+        isFresh: trades.length < 10,
+        isVeryFresh: trades.length < 3,
+        totalVolume: Math.round(totalVolume),
+        firstSeen: formatTimestamp(firstSeen)
+      },
+      // Aggregate trades by market
+      recentActivity: (() => {
+        const marketAgg = {};
+        
+        trades.forEach(t => {
+          const market = t.title || t.slug || 'Unknown Market';
+          const amount = parseFloat(t.usdcSize) || 0;
+          const side = t.side;
+          const key = `${market}-${side}-${t.outcome || 'YES'}`;
+          
+          if (!marketAgg[key]) {
+            marketAgg[key] = {
+              market: market,
+              marketSlug: t.slug,
+              eventSlug: t.eventSlug,
+              marketUrl: t.slug ? `https://polymarket.com/market/${t.slug}` : null,
+              side: side,
+              outcome: t.outcome,
+              totalAmount: 0,
+              tradeCount: 0,
+              avgPrice: 0,
+              priceSum: 0,
+              lastTime: 0,
+              firstTime: Infinity,
+              icon: t.icon
+            };
+          }
+          
+          marketAgg[key].totalAmount += amount;
+          marketAgg[key].tradeCount += 1;
+          marketAgg[key].priceSum += (parseFloat(t.price) || 0);
+          
+          const timestamp = t.timestamp < 1e12 ? t.timestamp * 1000 : t.timestamp;
+          if (timestamp > marketAgg[key].lastTime) {
+            marketAgg[key].lastTime = timestamp;
+          }
+          if (timestamp < marketAgg[key].firstTime) {
+            marketAgg[key].firstTime = timestamp;
+          }
+        });
+        
+        // Convert to array and calculate averages
+        return Object.values(marketAgg)
+          .map(m => ({
+            market: m.market,
+            marketSlug: m.marketSlug,
+            eventSlug: m.eventSlug,
+            marketUrl: m.marketUrl,
+            side: m.side,
+            outcome: m.outcome,
+            amount: Math.round(m.totalAmount),
+            tradeCount: m.tradeCount,
+            price: Math.round((m.priceSum / m.tradeCount) * 100),
+            time: formatTimestamp(m.lastTime),
+            icon: m.icon
+          }))
+          .filter(m => m.amount >= 10) // Filter out tiny aggregates
+          .sort((a, b) => new Date(b.time) - new Date(a.time))
+          .slice(0, 30);
+      })()
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Get current open positions for a wallet
+async function getWalletPositions(address) {
+  try {
+    const res = await fetch(`${POLYMARKET_API}/positions?user=${address}`);
+    if (!res.ok) throw new Error("Positions API error: " + res.status);
+    const positions = await res.json();
+    
+    if (!positions || positions.length === 0) {
+      return {
+        success: true,
+        totalPositions: 0,
+        totalValue: 0,
+        positions: []
+      };
+    }
+    
+    // Calculate total current value
+    const totalValue = positions.reduce((sum, p) => {
+      const value = parseFloat(p.currentValue) || parseFloat(p.value) || 0;
+      return sum + value;
+    }, 0);
+    
+    return {
+      success: true,
+      totalPositions: positions.length,
+      totalValue: Math.round(totalValue),
+      positions: positions.map(p => ({
+        market: p.title || p.market || 'Unknown',
+        marketSlug: p.slug,
+        marketUrl: p.slug ? `https://polymarket.com/market/${p.slug}` : null,
+        outcome: p.outcome,
+        size: parseFloat(p.size) || 0,
+        avgPrice: Math.round((parseFloat(p.avgPrice) || 0) * 100),
+        currentPrice: Math.round((parseFloat(p.curPrice) || parseFloat(p.currentPrice) || 0) * 100),
+        initialValue: Math.round(parseFloat(p.initialValue) || 0),
+        currentValue: Math.round(parseFloat(p.currentValue) || parseFloat(p.value) || 0),
+        pnl: Math.round((parseFloat(p.currentValue) || 0) - (parseFloat(p.initialValue) || 0)),
+        pnlPercent: parseFloat(p.initialValue) > 0 
+          ? Math.round(((parseFloat(p.currentValue) - parseFloat(p.initialValue)) / parseFloat(p.initialValue)) * 100)
+          : 0,
+        icon: p.icon
+      }))
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Get closed positions (resolved bets) and calculate PnL
+async function getWalletPnL(address) {
+  try {
+    // Fetch all activity to analyze bets
+    const [activityRes, positionsRes] = await Promise.all([
+      fetch(`${POLYMARKET_API}/activity?user=${address}&limit=500`),
+      fetch(`${POLYMARKET_API}/positions?user=${address}`)
+    ]);
+    
+    let activity = [];
+    let positions = [];
+    
+    if (activityRes.ok) {
+      activity = await activityRes.json() || [];
+    }
+    if (positionsRes.ok) {
+      positions = await positionsRes.json() || [];
+    }
+    
+    // Group activity by market to track full bet lifecycle
+    const marketBets = {};
+    
+    activity.forEach(a => {
+      const market = a.slug || a.conditionId;
+      if (!market) return;
+      
+      if (!marketBets[market]) {
+        marketBets[market] = {
+          title: a.title || market,
+          slug: a.slug,
+          icon: a.icon,
+          buys: [],
+          sells: [],
+          redeems: [],
+          outcome: a.outcome
+        };
+      }
+      
+      // Update outcome if we get one (some activities might have it, some might not)
+      if (a.outcome && !marketBets[market].outcome) {
+        marketBets[market].outcome = a.outcome;
+      }
+      
+      const usdValue = parseFloat(a.usdcSize) || parseFloat(a.usd_value) || 0;
+      const timestamp = a.timestamp < 1e12 ? a.timestamp * 1000 : a.timestamp;
+      
+      if (a.type === 'BUY' || a.side === 'BUY') {
+        marketBets[market].buys.push({ amount: usdValue, time: timestamp, price: parseFloat(a.price) || 0, outcome: a.outcome });
+      } else if (a.type === 'SELL' || a.side === 'SELL') {
+        marketBets[market].sells.push({ amount: usdValue, time: timestamp, price: parseFloat(a.price) || 0 });
+      } else if (a.type === 'REDEEM') {
+        marketBets[market].redeems.push({ amount: usdValue, time: timestamp });
+      }
+    });
+    
+    // Analyze each market bet
+    const resolvedBets = [];
+    const openBets = [];
+    let totalWins = 0;
+    let totalLosses = 0;
+    let winCount = 0;
+    let lossCount = 0;
+    
+    // Helper function to check if market is likely settled based on title/date
+    const isMarketLikelySettled = (title, slug, position) => {
+      const titleLower = (title || '').toLowerCase();
+      const slugLower = (slug || '').toLowerCase();
+      const now = new Date();
+      const currentYear = now.getFullYear();
+      const currentMonth = now.getMonth() + 1;
+      
+      // Check for past years in title (2024, 2023, etc. when we're in 2026)
+      const yearMatch = titleLower.match(/\b(20\d{2})\b/);
+      if (yearMatch) {
+        const year = parseInt(yearMatch[1]);
+        if (year < currentYear) {
+          return true; // Past year = settled
+        }
+      }
+      
+      // Check for specific past dates in slug (format: 2025-10-29)
+      const dateMatch = slugLower.match(/(\d{4})-(\d{2})-(\d{2})/);
+      if (dateMatch) {
+        const eventDate = new Date(parseInt(dateMatch[1]), parseInt(dateMatch[2]) - 1, parseInt(dateMatch[3]));
+        if (eventDate < now) {
+          return true; // Past date = settled
+        }
+      }
+      
+      // Check for month+year patterns like "October 2025"
+      const monthYearPatterns = [
+        /january\s+(\d{4})/i, /february\s+(\d{4})/i, /march\s+(\d{4})/i,
+        /april\s+(\d{4})/i, /may\s+(\d{4})/i, /june\s+(\d{4})/i,
+        /july\s+(\d{4})/i, /august\s+(\d{4})/i, /september\s+(\d{4})/i,
+        /october\s+(\d{4})/i, /november\s+(\d{4})/i, /december\s+(\d{4})/i
+      ];
+      
+      for (let i = 0; i < monthYearPatterns.length; i++) {
+        const match = titleLower.match(monthYearPatterns[i]);
+        if (match) {
+          const year = parseInt(match[1]);
+          const month = i + 1;
+          // If month/year is in the past
+          if (year < currentYear || (year === currentYear && month < currentMonth)) {
+            return true;
+          }
+        }
+      }
+      
+      // Check if current price is essentially resolved (99.5%+ or 0.5%-)
+      // This is tighter than before to avoid catching in-progress games
+      const curPrice = parseFloat(position?.curPrice || position?.currentPrice || 0);
+      if (curPrice >= 0.995 || curPrice <= 0.005) {
+        return true;
+      }
+      
+      return false;
+    };
+    
+    for (const [market, data] of Object.entries(marketBets)) {
+      const totalBought = data.buys.reduce((sum, b) => sum + b.amount, 0);
+      const totalSold = data.sells.reduce((sum, s) => sum + s.amount, 0);
+      const totalRedeemed = data.redeems.reduce((sum, r) => sum + r.amount, 0);
+      const avgBuyPrice = data.buys.length > 0 
+        ? data.buys.reduce((sum, b) => sum + b.price, 0) / data.buys.length 
+        : 0;
+      
+      // Check if market is resolved (has redeems or position is closed)
+      const position = positions.find(p => p.slug === market || p.conditionId === market);
+      const hasPosition = position && parseFloat(position.size || 0) > 0;
+      
+      // Check if market appears to be settled even if position shows as "open"
+      const likelySettled = isMarketLikelySettled(data.title, data.slug, position);
+      const isOpen = hasPosition && !likelySettled;
+      
+      if (totalRedeemed > 0) {
+        // Won - got payout
+        const profit = totalRedeemed - totalBought + totalSold;
+        totalWins += Math.max(0, profit);
+        winCount++;
+        resolvedBets.push({
+          market: data.title,
+          marketSlug: data.slug,
+          outcome: data.outcome,
+          result: 'WIN',
+          invested: Math.round(totalBought),
+          returned: Math.round(totalRedeemed + totalSold),
+          profit: Math.round(profit),
+          profitPct: totalBought > 0 ? Math.round((profit / totalBought) * 100) : 0,
+          avgPrice: Math.round(avgBuyPrice * 100),
+          time: data.redeems[0]?.time ? new Date(data.redeems[0].time).toISOString() : null,
+          icon: data.icon
+        });
+      } else if (!isOpen && totalBought > 0 && totalRedeemed === 0) {
+        // Market is settled (no position or likelySettled) with no redeem
+        // Check if this might be an unredeemed WIN based on current value
+        const currentValue = parseFloat(position?.currentValue || position?.value || 0);
+        const currentPrice = parseFloat(position?.curPrice || position?.currentPrice || 0);
+        
+        // If current value is significantly positive or price is near 100%, it's likely a win they haven't redeemed
+        if (currentValue > totalBought * 0.5 || currentPrice >= 0.95) {
+          // Likely an unredeemed WIN
+          const profit = currentValue - totalBought + totalSold;
+          if (profit > 0) {
+            totalWins += profit;
+            winCount++;
+          }
+          resolvedBets.push({
+            market: data.title,
+            marketSlug: data.slug,
+            outcome: data.outcome,
+            result: 'WIN',
+            invested: Math.round(totalBought),
+            returned: Math.round(currentValue + totalSold),
+            profit: Math.round(profit),
+            profitPct: totalBought > 0 ? Math.round((profit / totalBought) * 100) : 0,
+            avgPrice: Math.round(avgBuyPrice * 100),
+            time: data.buys[data.buys.length - 1]?.time ? new Date(data.buys[data.buys.length - 1].time).toISOString() : null,
+            icon: data.icon,
+            note: 'Unredeemed'
+          });
+        } else {
+          // Lost - bought but no redeem and low/no value
+          const loss = totalBought - totalSold - currentValue;
+          if (loss > 0) {
+            totalLosses += loss;
+            lossCount++;
+            resolvedBets.push({
+              market: data.title,
+              marketSlug: data.slug,
+              outcome: data.outcome,
+              result: 'LOSS',
+              invested: Math.round(totalBought),
+              returned: Math.round(totalSold + currentValue),
+              profit: Math.round(-loss),
+              profitPct: totalBought > 0 ? Math.round((-loss / totalBought) * 100) : 0,
+              avgPrice: Math.round(avgBuyPrice * 100),
+              time: data.buys[data.buys.length - 1]?.time ? new Date(data.buys[data.buys.length - 1].time).toISOString() : null,
+              icon: data.icon
+            });
+          }
+        }
+      } else if (isOpen) {
+        // Check if this is actually a resolved loss (current value is $0 or near $0)
+        const currentValue = parseFloat(position.currentValue || position.value || 0);
+        const currentPrice = parseFloat(position.curPrice || position.currentPrice || 0);
+        
+        // If current value is $0 (or very small) and they invested significant money, it's a loss
+        // Also check if current price is near 0 (market resolved against this position)
+        if ((currentValue < 1 || currentPrice < 0.02) && totalBought > 100) {
+          // This is a resolved loss, not an open position
+          const loss = totalBought - totalSold;
+          totalLosses += loss;
+          lossCount++;
+          resolvedBets.push({
+            market: data.title,
+            marketSlug: data.slug,
+            outcome: data.outcome,
+            result: 'LOSS',
+            invested: Math.round(totalBought),
+            returned: Math.round(totalSold),
+            profit: Math.round(-loss),
+            profitPct: totalBought > 0 ? Math.round((-loss / totalBought) * 100) : 0,
+            avgPrice: Math.round(avgBuyPrice * 100),
+            time: data.buys[data.buys.length - 1]?.time ? new Date(data.buys[data.buys.length - 1].time).toISOString() : null,
+            icon: data.icon
+          });
+        } else {
+          // Actually still open - use position outcome as fallback
+          const outcomeToUse = data.outcome || position.outcome || 
+            (data.buys.length > 0 ? data.buys[0].outcome : null);
+          const unrealizedPnL = currentValue - totalBought + totalSold;
+          openBets.push({
+            market: data.title,
+            marketSlug: data.slug,
+            outcome: outcomeToUse,
+            invested: Math.round(totalBought),
+            currentValue: Math.round(currentValue),
+            unrealizedPnL: Math.round(unrealizedPnL),
+            unrealizedPct: totalBought > 0 ? Math.round((unrealizedPnL / totalBought) * 100) : 0,
+            avgPrice: Math.round(avgBuyPrice * 100),
+            currentPrice: Math.round((parseFloat(position.curPrice) || 0) * 100),
+            icon: data.icon
+          });
+        }
+      }
+    }
+    
+    // Sort resolved bets by time (most recent first)
+    resolvedBets.sort((a, b) => new Date(b.time || 0) - new Date(a.time || 0));
+    
+    const totalInvested = Object.values(marketBets).reduce((sum, m) => 
+      sum + m.buys.reduce((s, b) => s + b.amount, 0), 0);
+    
+    const realizedPnL = totalWins - totalLosses;
+    const unrealizedPnL = openBets.reduce((sum, b) => sum + b.unrealizedPnL, 0);
+    
+    return {
+      success: true,
+      summary: {
+        totalInvested: Math.round(totalInvested),
+        realizedPnL: Math.round(realizedPnL),
+        unrealizedPnL: Math.round(unrealizedPnL),
+        totalPnL: Math.round(realizedPnL + unrealizedPnL),
+        totalWins: Math.round(totalWins),
+        totalLosses: Math.round(totalLosses),
+        winCount,
+        lossCount,
+        winRate: winCount + lossCount > 0 ? Math.round((winCount / (winCount + lossCount)) * 100) : 0,
+        openPositions: openBets.length
+      },
+      resolvedBets: resolvedBets.slice(0, 50),
+      openBets: openBets.slice(0, 20)
+    };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Send SMS via Twilio
+async function sendSMS(to, message, env) {
+  const accountSid = env.TWILIO_SID;
+  const authToken = env.TWILIO_AUTH;
+  const fromPhone = env.TWILIO_PHONE;
+  
+  if (!accountSid || !authToken || !fromPhone) {
+    return { success: false, error: "Twilio credentials not configured" };
+  }
+  
+  // Ensure phone has + prefix
+  const toPhone = to.startsWith('+') ? to : `+1${to.replace(/\D/g, '')}`;
+  
+  try {
+    const response = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Basic ' + btoa(`${accountSid}:${authToken}`),
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          To: toPhone,
+          From: fromPhone,
+          Body: message,
+        }),
+      }
+    );
+    
+    const result = await response.json();
+    
+    if (response.ok) {
+      return { success: true, messageId: result.sid };
+    } else {
+      return { success: false, error: result.message || 'Failed to send SMS' };
+    }
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+// Send alert for a specific signal
+async function sendSMSAlert(data, env) {
+  const { phone, signal } = data;
+  
+  if (!phone || !signal) {
+    return { success: false, error: "Phone and signal required" };
+  }
+  
+  const message = `🚨 POLYMARKET ALERT
+
+${signal.marketTitle}
+
+💰 Volume: $${signal.suspiciousVolume.toLocaleString()}
+🎯 Largest Bet: $${signal.largestBet.toLocaleString()}
+📊 Score: ${signal.score}
+${signal.direction}: ${signal.avgEntryPrice}%
+
+🔗 polymarket.com/market/${signal.marketSlug}`;
+
+  return await sendSMS(phone, message, env);
+}
+
+// Subscribe a user to alerts (stores in KV)
+async function subscribeToAlerts(data, env) {
+  const { phone, email, minScore = 100, minBet = 10000, categories = ['all'] } = data;
+  
+  if (!phone) {
+    return { success: false, error: "Phone number required" };
+  }
+  
+  // Get existing subscribers
+  let subscribers = [];
+  if (env.SIGNALS_CACHE) {
+    try {
+      const existing = await env.SIGNALS_CACHE.get("alert_subscribers", { type: "json" });
+      if (existing && Array.isArray(existing)) {
+        subscribers = existing;
+      }
+    } catch (e) {}
+  }
+  
+  // Check if already subscribed
+  const existingIndex = subscribers.findIndex(s => s.phone === phone);
+  
+  const subscriber = {
+    phone,
+    email: email || null,
+    minScore,
+    minBet,
+    categories,
+    subscribedAt: new Date().toISOString(),
+    active: true
+  };
+  
+  if (existingIndex >= 0) {
+    subscribers[existingIndex] = { ...subscribers[existingIndex], ...subscriber };
+  } else {
+    subscribers.push(subscriber);
+  }
+  
+  // Save back to KV
+  if (env.SIGNALS_CACHE) {
+    await env.SIGNALS_CACHE.put("alert_subscribers", JSON.stringify(subscribers));
+  }
+  
+  return { success: true, message: "Subscribed to alerts", subscriber };
+}
+
+// Get all alert subscribers
+async function getAlertSubscribers(env) {
+  if (!env.SIGNALS_CACHE) {
+    return { success: false, error: "Cache not available" };
+  }
+  
+  try {
+    const subscribers = await env.SIGNALS_CACHE.get("alert_subscribers", { type: "json" });
+    return { success: true, subscribers: subscribers || [] };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
+
+// Check and send alerts for new signals (called during cron)
+async function checkAndSendAlerts(signals, env) {
+  if (!env.SIGNALS_CACHE) return;
+  
+  // Get subscribers
+  let subscribers = [];
+  try {
+    const existing = await env.SIGNALS_CACHE.get("alert_subscribers", { type: "json" });
+    if (existing && Array.isArray(existing)) {
+      subscribers = existing.filter(s => s.active);
+    }
+  } catch (e) {
+    return;
+  }
+  
+  if (subscribers.length === 0) return;
+  
+  // Get already-alerted signal IDs
+  let alertedSignals = [];
+  try {
+    const alerted = await env.SIGNALS_CACHE.get("alerted_signals", { type: "json" });
+    if (alerted && Array.isArray(alerted)) {
+      alertedSignals = alerted;
+    }
+  } catch (e) {}
+  
+  const newAlerted = [...alertedSignals];
+  
+  for (const signal of signals) {
+    // Skip if already alerted
+    if (alertedSignals.includes(signal.id)) continue;
+    
+    // Determine signal category
+    const title = (signal.marketTitle || '').toLowerCase();
+    let category = 'other';
+    if (SPORTS_KEYWORDS.some(k => title.includes(k)) || title.includes(' vs ')) {
+      category = 'sports';
+    } else if (POLITICAL_KEYWORDS.some(k => title.includes(k))) {
+      category = 'politics';
+    } else if (CRYPTO_KEYWORDS.some(k => title.includes(k))) {
+      category = 'crypto';
+    }
+    
+    // Check each subscriber
+    for (const sub of subscribers) {
+      // Check thresholds
+      if (signal.score < sub.minScore) continue;
+      if (signal.largestBet < sub.minBet) continue;
+      
+      // Check category
+      if (!sub.categories.includes('all') && !sub.categories.includes(category)) continue;
+      
+      // Send alert
+      await sendSMSAlert({ phone: sub.phone, signal }, env);
+      
+      // Small delay to avoid rate limits
+      await new Promise(r => setTimeout(r, 100));
+    }
+    
+    // Mark as alerted
+    newAlerted.push(signal.id);
+  }
+  
+  // Save alerted signals (keep last 1000 to prevent unbounded growth)
+  const trimmedAlerted = newAlerted.slice(-1000);
+  await env.SIGNALS_CACHE.put("alerted_signals", JSON.stringify(trimmedAlerted));
+}
