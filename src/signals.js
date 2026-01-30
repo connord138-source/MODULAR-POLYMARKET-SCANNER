@@ -199,25 +199,21 @@ export async function runScan(hours, minScore, env, options = {}) {
       signalsFound: allSignals.length,
       newSignals: newSignals.length,
       storedSignals: allSignals.length - newSignals.length,
-      signals: allSignals.slice(0, 50),
-      mode: sportsOnly ? 'sports-games-only' : 'all-markets'
+      signals: allSignals
     };
     
-    if (sportsOnly) {
-      result.filtered = {
+    if (includeDebug) {
+      result.debug = {
         skippedFutures,
         skippedNonSports,
-        gamesAnalyzed: Object.keys(marketGroups).length
+        allMarkets: debugInfo
       };
-    }
-    
-    if (includeDebug) {
-      result.debug = debugInfo.slice(0, 100);
     }
     
     return result;
     
   } catch (e) {
+    console.error("Scan error:", e.message);
     return {
       success: false,
       error: e.message
