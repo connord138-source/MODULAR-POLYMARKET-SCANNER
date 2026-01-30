@@ -173,4 +173,4 @@ export const corsHeaders = {
 };
 
 // Version
-export const VERSION = "18.4.6 - Fix entry price normalization for YES/NO trades";
+export const VERSION = "18.5.0 - Fresh wallet detection, filter gambling/sure-bets, wallet activity API";
