@@ -109,6 +109,7 @@ export async function runScan(hours, minScore, env, options = {}) {
           totalVolume: market.totalVolume,
           walletCount: market.wallets.size,
           wallets: Array.from(market.wallets).slice(0, 10),
+          topTrades: analysis.topTrades || [],   // Top trades by size
           detectedAt: new Date().toISOString(),
           marketType: marketType,
           isGame: classification.isGame,
@@ -239,10 +240,15 @@ function analyzeMarket(market) {
   // Group trades by direction with their prices
   const directionData = {};
   
+  // Build top trades list (sorted by size)
+  const tradesList = [];
+  
   for (const trade of trades) {
     const price = parseFloat(trade.price || 0);
     const size = parseFloat(trade.size || 0);
     const direction = trade.outcome || trade.side || 'unknown';
+    const wallet = trade.maker || trade.taker || 'unknown';
+    const timestamp = trade.timestamp ? new Date(trade.timestamp * 1000).toISOString() : new Date().toISOString();
     
     if (size > largestBet) {
       largestBet = size;
@@ -256,7 +262,21 @@ function analyzeMarket(market) {
     directionData[direction].volume += size;
     directionData[direction].totalPrice += price;
     directionData[direction].count += 1;
+    
+    // Add to trades list for topTrades
+    tradesList.push({
+      wallet,
+      amount: size,
+      price: Math.round(price * 100),
+      direction,
+      time: timestamp
+    });
   }
+  
+  // Sort by amount descending and take top 10
+  const topTrades = tradesList
+    .sort((a, b) => b.amount - a.amount)
+    .slice(0, 10);
   
   // Determine dominant direction by volume
   let dominantDirection = largestBetDirection;
@@ -292,7 +312,7 @@ function analyzeMarket(market) {
   
   // Skip if event has started (use display price for this check)
   if (hasEventStarted(market.title, market.slug, displayPrice)) {
-    return { score: 0, factors: [], direction: dominantDirection, avgPrice: displayPrice, entryPrice: avgEntryPrice, largestBet };
+    return { score: 0, factors: [], direction: dominantDirection, avgPrice: displayPrice, entryPrice: avgEntryPrice, largestBet, topTrades: [] };
   }
   
   // Use entry price for scoring (what they actually paid)
@@ -364,7 +384,8 @@ function analyzeMarket(market) {
     avgPrice: displayPrice,      // Current market price (what YES is at)
     entryPrice: avgEntryPrice,   // What they paid
     largestBet,
-    isNoBet                      // Whether they bet NO
+    isNoBet,                     // Whether they bet NO
+    topTrades                    // Top 10 trades by size
   };
 }
 
