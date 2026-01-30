@@ -173,4 +173,4 @@ export const corsHeaders = {
 };
 
 // Version
-export const VERSION = "18.4.5 - Add topTrades to signals, admin wallet reset endpoints";
+export const VERSION = "18.4.6 - Fix entry price normalization for YES/NO trades";
