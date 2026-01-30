@@ -173,4 +173,4 @@ export const corsHeaders = {
 };
 
 // Version
-export const VERSION = "18.4.1 - Fix duplicate signals, dedupe by marketSlug";
+export const VERSION = "18.4.4 - Add admin wallet reset endpoints";
