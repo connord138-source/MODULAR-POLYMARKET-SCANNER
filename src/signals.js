@@ -1,11 +1,33 @@
 // ============================================================
 // SIGNALS.JS - Signal Detection and Scoring
+// v18.4.6 - Fix entry price normalization for YES/NO trades
 // ============================================================
 
 import { POLYMARKET_API, SCORES, KV_KEYS } from './config.js';
 import { detectMarketType, hasEventStarted, generateId, isSportsGame, classifyMarket } from './utils.js';
 import { trackWalletBet } from './wallets.js';
 import { calculateConfidence } from './learning.js';
+
+// Helper to check if an outcome is a "NO" type bet
+function isNoBet(outcome) {
+  if (!outcome) return false;
+  const lower = String(outcome).toLowerCase();
+  return lower === 'no' || lower === 'false' || lower === '0';
+}
+
+// Helper to normalize price to implied YES price
+// If someone buys NO at 0.95, the implied YES price is 0.05 (5%)
+// If someone buys YES at 0.50, the implied YES price is 0.50 (50%)
+function normalizeToYesPrice(rawPrice, outcome) {
+  const price = parseFloat(rawPrice || 0);
+  
+  // If this is a NO bet, convert to implied YES price
+  if (isNoBet(outcome)) {
+    return 1 - price;
+  }
+  
+  return price;
+}
 
 // Main scan function
 export async function runScan(hours, minScore, env, options = {}) {
@@ -103,7 +125,7 @@ export async function runScan(hours, minScore, env, options = {}) {
           factors: analysis.factors,
           direction: analysis.direction,
           priceAtSignal: analysis.avgPrice,      // Current market YES price
-          entryPrice: analysis.entryPrice,       // What they paid
+          entryPrice: analysis.entryPrice,       // What they paid (normalized)
           isNoBet: analysis.isNoBet,             // Whether they bet NO
           largestBet: analysis.largestBet,
           totalVolume: market.totalVolume,
@@ -199,21 +221,25 @@ export async function runScan(hours, minScore, env, options = {}) {
       signalsFound: allSignals.length,
       newSignals: newSignals.length,
       storedSignals: allSignals.length - newSignals.length,
-      signals: allSignals
+      signals: allSignals.slice(0, 50),
+      mode: sportsOnly ? 'sports-games-only' : 'all-markets'
     };
     
-    if (includeDebug) {
-      result.debug = {
+    if (sportsOnly) {
+      result.filtered = {
         skippedFutures,
         skippedNonSports,
-        allMarkets: debugInfo
+        gamesAnalyzed: Object.keys(marketGroups).length
       };
+    }
+    
+    if (includeDebug) {
+      result.debug = debugInfo.slice(0, 100);
     }
     
     return result;
     
   } catch (e) {
-    console.error("Scan error:", e.message);
     return {
       success: false,
       error: e.message
@@ -240,32 +266,38 @@ function analyzeMarket(market) {
   const tradesList = [];
   
   for (const trade of trades) {
-    const price = parseFloat(trade.price || 0);
+    const rawPrice = parseFloat(trade.price || 0);
     const size = parseFloat(trade.size || 0);
     const direction = trade.outcome || trade.side || 'unknown';
     const wallet = trade.maker || trade.taker || 'unknown';
     const timestamp = trade.timestamp ? new Date(trade.timestamp * 1000).toISOString() : new Date().toISOString();
     
+    // Normalize price to implied YES price for display
+    const normalizedPrice = normalizeToYesPrice(rawPrice, direction);
+    
     if (size > largestBet) {
       largestBet = size;
       largestBetDirection = direction;
-      largestBetPrice = price;
+      largestBetPrice = rawPrice;
     }
     
     if (!directionData[direction]) {
       directionData[direction] = { volume: 0, totalPrice: 0, count: 0 };
     }
     directionData[direction].volume += size;
-    directionData[direction].totalPrice += price;
+    directionData[direction].totalPrice += rawPrice;
     directionData[direction].count += 1;
     
     // Add to trades list for topTrades
+    // Use normalized price so all trades show implied YES market price
     tradesList.push({
       wallet,
       amount: size,
-      price: Math.round(price * 100),
+      price: Math.round(normalizedPrice * 100),  // Now normalized!
       direction,
-      time: timestamp
+      time: timestamp,
+      rawPrice: Math.round(rawPrice * 100),  // Keep raw price for debugging
+      isNo: isNoBet(direction)
     });
   }
   
@@ -287,32 +319,25 @@ function analyzeMarket(market) {
   // Calculate the entry price for the dominant direction
   // This is what they paid (e.g., 77 cents for NO shares)
   const dominantData = directionData[dominantDirection] || { totalPrice: 0, count: 1 };
-  const avgEntryPrice = dominantData.count > 0 
-    ? Math.round((dominantData.totalPrice / dominantData.count) * 100) 
-    : 50;
-  
-  // For display, we want to show the IMPLIED market price
-  // If they bet NO at 77 cents, the YES price is ~23%
-  // If they bet YES at 77 cents, the YES price is 77%
-  let displayPrice = avgEntryPrice;
+  const avgRawEntryPrice = dominantData.count > 0 
+    ? (dominantData.totalPrice / dominantData.count)
+    : 0.5;
   
   // Normalize direction names
   const dirLower = (dominantDirection || '').toLowerCase();
-  const isNoBet = dirLower === 'no' || dirLower === 'false' || dirLower === '0';
+  const dominantIsNoBet = isNoBet(dominantDirection);
   
-  // If they bet NO, the display should show what they're betting AGAINST
-  // i.e., if NO is 77 cents, YES is ~23 cents
-  if (isNoBet) {
-    displayPrice = 100 - avgEntryPrice;
-  }
+  // For display, normalize to implied YES price
+  // If they bet NO at 77 cents, the YES price is ~23%
+  // If they bet YES at 77 cents, the YES price is 77%
+  const normalizedEntryPrice = normalizeToYesPrice(avgRawEntryPrice, dominantDirection);
+  const displayPrice = Math.round(normalizedEntryPrice * 100);
+  const avgEntryPrice = displayPrice;  // Now both are the same (normalized YES price)
   
   // Skip if event has started (use display price for this check)
   if (hasEventStarted(market.title, market.slug, displayPrice)) {
     return { score: 0, factors: [], direction: dominantDirection, avgPrice: displayPrice, entryPrice: avgEntryPrice, largestBet, topTrades: [] };
   }
-  
-  // Use entry price for scoring (what they actually paid)
-  const priceForScoring = avgEntryPrice;
   
   // SCORING: Whale bet size
   if (largestBet >= 50000) {
@@ -344,9 +369,7 @@ function analyzeMarket(market) {
     factors.push({ name: 'volumeModerate', score: SCORES.VOLUME_MODERATE, detail: `$${Math.round(totalVolume/1000)}k volume` });
   }
   
-  // SCORING: Extreme odds (based on what they're betting ON, use displayPrice)
-  // If they bet NO on a 5% YES market, they got great value (95% NO)
-  // If they bet YES on a 5% market, that's a longshot
+  // SCORING: Extreme odds (based on normalized YES price)
   if (displayPrice <= 15) {
     score += SCORES.EXTREME_LONGSHOT;
     factors.push({ name: 'extremeOdds', score: SCORES.EXTREME_LONGSHOT, detail: `Longshot at ${displayPrice}%` });
@@ -377,11 +400,11 @@ function analyzeMarket(market) {
     score,
     factors,
     direction: dominantDirection,
-    avgPrice: displayPrice,      // Current market price (what YES is at)
-    entryPrice: avgEntryPrice,   // What they paid
+    avgPrice: displayPrice,      // Normalized YES price
+    entryPrice: avgEntryPrice,   // Normalized YES price
     largestBet,
-    isNoBet,                     // Whether they bet NO
-    topTrades                    // Top 10 trades by size
+    isNoBet: dominantIsNoBet,    // Whether dominant direction was NO
+    topTrades                    // Top 10 trades by size (with normalized prices)
   };
 }
 
