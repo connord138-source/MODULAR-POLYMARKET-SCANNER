@@ -217,9 +217,10 @@ export default {
           
           return jsonResponse({
             success: true,
-            totalTrades: allTrades.length,
-            sportTradesCount: sportsTrades.length,
-            uniqueSlugs: uniqueSlugs.slice(0, 30),
+            sport,
+            totalTrades: sportsTrades.length,
+            uniqueMarkets: uniqueSlugs.length,
+            slugs: uniqueSlugs.slice(0, 20),
             sampleTrades
           });
         } catch (e) {
@@ -229,33 +230,23 @@ export default {
       
       if (path === "/odds/compare") {
         const sport = url.searchParams.get("sport") || "nba";
-        const sportKey = SPORT_KEY_MAP[sport];
+        const sportKey = SPORT_KEY_MAP[sport.toLowerCase()];
         
         if (!sportKey) {
-          return jsonResponse({ success: false, error: "Sport not supported" });
+          return jsonResponse({ success: false, error: `Unknown sport: ${sport}` });
         }
         
-        if (!env.ODDS_API_KEY) {
-          return jsonResponse({ success: false, error: "Odds API not configured" });
-        }
-        
-        const oddsData = await getGameOdds(env, sportKey, 'h2h,spreads');
-        return jsonResponse({ 
-          success: true, 
-          sport, 
-          sportKey, 
-          gamesCount: oddsData?.length || 0,
-          games: oddsData || []
-        });
+        const odds = await getGameOdds(env, sportKey);
+        return jsonResponse({ success: true, sport, odds });
       }
       
       if (path === "/odds/scores") {
         const sport = url.searchParams.get("sport") || "nba";
         const days = parseInt(url.searchParams.get("days") || "3");
-        const sportKey = SPORT_KEY_MAP[sport];
+        const sportKey = SPORT_KEY_MAP[sport.toLowerCase()];
         
         if (!sportKey) {
-          return jsonResponse({ success: false, error: "Sport not supported" });
+          return jsonResponse({ success: false, error: `Unknown sport: ${sport}` });
         }
         
         const scores = await getGameScores(env, sportKey, days);
