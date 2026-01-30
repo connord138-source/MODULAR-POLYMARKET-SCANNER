@@ -5,12 +5,14 @@
 //   - Filter extreme odds (sure bets)
 //   - Proper wallet extraction (proxyWallet)
 //   - Gambling market filtering
+//   - Use accumulated trades from KV when available
 // ============================================================
 
 import { POLYMARKET_API, SCORES, KV_KEYS } from './config.js';
 import { detectMarketType, hasEventStarted, generateId, isSportsGame, classifyMarket } from './utils.js';
 import { trackWalletBet } from './wallets.js';
 import { calculateConfidence } from './learning.js';
+import { getAccumulatedTrades } from './trades.js';
 
 // ============================================================
 // GAMBLING MARKET FILTER
@@ -118,14 +120,31 @@ export async function runScan(hours, minScore, env, options = {}) {
   const { sportsOnly = false, includeDebug = false, includeStored = true } = options;
   
   try {
-    // Fetch trades from API
-    const TRADE_LIMIT = 5000;
-    const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=${TRADE_LIMIT}`);
-    if (!tradesRes.ok) {
-      throw new Error(`Trades API error: ${tradesRes.status}`);
+    // ============================================================
+    // FETCH TRADES - Try accumulated KV first, fallback to API
+    // ============================================================
+    let allTrades = [];
+    let tradesSource = 'api';
+    
+    // Try to get accumulated trades from KV
+    const accumulated = await getAccumulatedTrades(env, hours);
+    
+    if (accumulated.fromKV && accumulated.trades.length > 100) {
+      // Use accumulated trades if we have a decent amount
+      allTrades = accumulated.trades;
+      tradesSource = 'kv';
+      console.log(`Using ${allTrades.length} accumulated trades from KV`);
+    } else {
+      // Fallback to direct API call
+      const TRADE_LIMIT = 5000;
+      const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=${TRADE_LIMIT}`);
+      if (!tradesRes.ok) {
+        throw new Error(`Trades API error: ${tradesRes.status}`);
+      }
+      allTrades = await tradesRes.json();
+      console.log(`Using ${allTrades.length} trades from API (KV had ${accumulated.trades?.length || 0})`);
     }
     
-    const allTrades = await tradesRes.json();
     const cutoffTime = Date.now() - (hours * 60 * 60 * 1000);
     
     // Debug stats
@@ -141,8 +160,10 @@ export async function runScan(hours, minScore, env, options = {}) {
     
     // API stats for debugging
     const apiStats = {
-      requestedLimit: TRADE_LIMIT,
-      totalFromApi: allTrades.length,
+      tradesSource,
+      kvTradesAvailable: accumulated.trades?.length || 0,
+      requestedLimit: tradesSource === 'api' ? 5000 : null,
+      totalFromSource: allTrades.length,
       oldestTradeTime: allTrades.length > 0 ? new Date(allTrades[allTrades.length - 1].timestamp * 1000).toISOString() : null,
       newestTradeTime: allTrades.length > 0 ? new Date(allTrades[0].timestamp * 1000).toISOString() : null,
       cutoffTime: new Date(cutoffTime).toISOString()
