@@ -436,6 +436,77 @@ export default {
         });
       }
       
+      // ============ ADMIN ENDPOINTS ============
+      
+      // Admin endpoint to reset stale wallet data
+      if (path === "/admin/reset-wallets" && request.method === "POST") {
+        const authHeader = request.headers.get("Authorization");
+        // Simple auth - change this secret in production!
+        if (authHeader !== "Bearer polymarket-admin-2026") {
+          return jsonResponse({ error: "Unauthorized" }, 401);
+        }
+        
+        try {
+          const clearedKeys = [];
+          
+          // Clear wallet index
+          await env.SIGNALS_CACHE.delete("tracked_wallet_index");
+          clearedKeys.push("tracked_wallet_index");
+          
+          // Get and clear all wallet_* keys (the old format that has null addresses)
+          // Note: KV doesn't support list, so we just clear the index which is the main issue
+          
+          return jsonResponse({ 
+            success: true, 
+            message: "Wallet index cleared. New signals will repopulate leaderboard with fresh data.",
+            clearedKeys,
+            note: "Individual wallet stats remain but won't appear in leaderboard until re-tracked"
+          });
+        } catch (error) {
+          return jsonResponse({ error: error.message }, 500);
+        }
+      }
+      
+      // Debug endpoint to see wallet data structure issues
+      if (path === "/admin/wallet-debug") {
+        if (!env.SIGNALS_CACHE) {
+          return jsonResponse({ success: false, error: "No cache" });
+        }
+        
+        try {
+          const walletIndex = await env.SIGNALS_CACHE.get("tracked_wallet_index", { type: "json" }) || [];
+          
+          // Check for problematic entries
+          const issues = {
+            nullEntries: walletIndex.filter(w => w === null).length,
+            undefinedEntries: walletIndex.filter(w => w === undefined).length,
+            emptyStrings: walletIndex.filter(w => w === '').length,
+            validAddresses: walletIndex.filter(w => w && typeof w === 'string' && w.startsWith('0x')).length
+          };
+          
+          // Sample the first few to show structure
+          const sampleEntries = walletIndex.slice(0, 10).map((entry, i) => ({
+            index: i,
+            value: entry,
+            type: typeof entry,
+            isNull: entry === null,
+            isValid: entry && typeof entry === 'string' && entry.startsWith('0x')
+          }));
+          
+          return jsonResponse({
+            success: true,
+            totalInIndex: walletIndex.length,
+            issues,
+            sampleEntries,
+            recommendation: issues.nullEntries > 0 || issues.undefinedEntries > 0 
+              ? "Run POST /admin/reset-wallets to clear corrupted data" 
+              : "Index looks healthy"
+          });
+        } catch (error) {
+          return jsonResponse({ error: error.message }, 500);
+        }
+      }
+      
       // ============ HEALTH/INFO ============
       
       if (path === "/" || path === "/health") {
