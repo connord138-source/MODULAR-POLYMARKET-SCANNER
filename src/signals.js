@@ -1,6 +1,6 @@
 // ============================================================
 // SIGNALS.JS - Signal Detection and Scoring
-// v18.4.7 - Increase trade limit, fix volume tracking
+// v18.4.8 - Fix wallet extraction, add lower scoring tiers
 // ============================================================
 
 import { POLYMARKET_API, SCORES, KV_KEYS } from './config.js';
@@ -24,14 +24,38 @@ function normalizeToYesPrice(rawPrice, outcome) {
   return price;
 }
 
+// Extract wallet address from trade object
+function extractWallet(trade) {
+  // Polymarket API uses different fields for wallet addresses
+  // Try multiple possible fields
+  const wallet = trade.maker || 
+                 trade.taker || 
+                 trade.user || 
+                 trade.owner ||
+                 trade.trader ||
+                 trade.account ||
+                 trade.address ||
+                 trade.wallet;
+  
+  // Validate it looks like an address
+  if (wallet && typeof wallet === 'string' && wallet.length > 10) {
+    return wallet;
+  }
+  
+  // Check nested objects
+  if (trade.makerOrder?.maker) return trade.makerOrder.maker;
+  if (trade.takerOrder?.taker) return trade.takerOrder.taker;
+  
+  return null;
+}
+
 // Main scan function
 export async function runScan(hours, minScore, env, options = {}) {
   const startTime = Date.now();
   const { sportsOnly = false, includeDebug = false, includeStored = true } = options;
   
   try {
-    // INCREASED LIMIT: Fetch more trades to cover longer time periods
-    // Polymarket can have 10k+ trades per hour during busy times
+    // Polymarket API caps at certain limits - try to get as many as possible
     const TRADE_LIMIT = 5000;
     
     const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=${TRADE_LIMIT}`);
@@ -43,21 +67,25 @@ export async function runScan(hours, minScore, env, options = {}) {
     const cutoffTime = Date.now() - (hours * 60 * 60 * 1000);
     const recentTrades = allTrades.filter(t => t.timestamp * 1000 > cutoffTime);
     
-    // Debug: Track what we're getting from API
+    // Debug: Track API response
     const apiStats = {
+      requestedLimit: TRADE_LIMIT,
       totalFromApi: allTrades.length,
       withinTimeWindow: recentTrades.length,
       oldestTradeTime: allTrades.length > 0 ? new Date(allTrades[allTrades.length - 1].timestamp * 1000).toISOString() : null,
       newestTradeTime: allTrades.length > 0 ? new Date(allTrades[0].timestamp * 1000).toISOString() : null,
-      cutoffTime: new Date(cutoffTime).toISOString()
+      cutoffTime: new Date(cutoffTime).toISOString(),
+      // Sample a trade to see its structure
+      sampleTradeFields: allTrades.length > 0 ? Object.keys(allTrades[0]) : []
     };
     
     // Group by market
     const marketGroups = {};
     let skippedFutures = 0;
     let skippedNonSports = 0;
-    let skippedStarted = 0;
     let totalVolumeTracked = 0;
+    let walletsFound = 0;
+    let walletsNull = 0;
     
     for (const trade of recentTrades) {
       const marketKey = trade.eventSlug || trade.slug || trade.market;
@@ -65,12 +93,18 @@ export async function runScan(hours, minScore, env, options = {}) {
       
       const title = trade.eventTitle || trade.title || marketKey;
       const tradeSize = parseFloat(trade.size || 0);
+      const wallet = extractWallet(trade);
+      
+      if (wallet) {
+        walletsFound++;
+      } else {
+        walletsNull++;
+      }
       
       // If sportsOnly mode, filter out non-game markets
       if (sportsOnly) {
         const classification = classifyMarket(title, marketKey);
         
-        // Skip futures/props
         if (!classification.isGame) {
           if (classification.marketType === 'futures') {
             skippedFutures++;
@@ -93,9 +127,14 @@ export async function runScan(hours, minScore, env, options = {}) {
       
       marketGroups[marketKey].trades.push(trade);
       marketGroups[marketKey].totalVolume += tradeSize;
-      marketGroups[marketKey].wallets.add(trade.maker || trade.taker);
+      if (wallet) {
+        marketGroups[marketKey].wallets.add(wallet);
+      }
       totalVolumeTracked += tradeSize;
     }
+    
+    apiStats.walletsFound = walletsFound;
+    apiStats.walletsNull = walletsNull;
     
     // Analyze each market
     const newSignals = [];
@@ -112,7 +151,8 @@ export async function runScan(hours, minScore, env, options = {}) {
       
       // Track why markets were skipped
       if (analysis.score < minScore) {
-        const reason = `score_${Math.floor(analysis.score / 10) * 10}`;
+        const bucket = Math.floor(analysis.score / 10) * 10;
+        const reason = `score_${bucket}-${bucket + 9}`;
         skippedReasons[reason] = (skippedReasons[reason] || 0) + 1;
       }
       
@@ -131,12 +171,13 @@ export async function runScan(hours, minScore, env, options = {}) {
           entryPrice: analysis.entryPrice,
           walletCount: market.wallets.size,
           tradeCount: market.trades.length,
-          skippedBecause: analysis.score < minScore ? 'below_min_score' : (analysis.skippedReason || null)
+          isNoBet: analysis.isNoBet
         });
       }
       
       if (analysis.score >= minScore) {
-        // Build signal object
+        const walletArray = Array.from(market.wallets).filter(w => w !== null);
+        
         const signal = {
           id: generateId(),
           marketSlug: slug,
@@ -149,8 +190,8 @@ export async function runScan(hours, minScore, env, options = {}) {
           isNoBet: analysis.isNoBet,
           largestBet: analysis.largestBet,
           totalVolume: market.totalVolume,
-          walletCount: market.wallets.size,
-          wallets: Array.from(market.wallets).slice(0, 10),
+          walletCount: walletArray.length || market.wallets.size,
+          wallets: walletArray.slice(0, 10),
           topTrades: analysis.topTrades || [],
           detectedAt: new Date().toISOString(),
           marketType: marketType,
@@ -177,14 +218,16 @@ export async function runScan(hours, minScore, env, options = {}) {
         if (env.SIGNALS_CACHE) {
           await storeSignal(env, signal);
           
-          for (const wallet of signal.wallets) {
-            await trackWalletBet(env, wallet, {
-              signalId: signal.id,
-              market: signal.marketTitle,
-              direction: signal.direction,
-              amount: analysis.largestBet,
-              price: analysis.avgPrice
-            });
+          for (const wallet of walletArray.slice(0, 10)) {
+            if (wallet) {
+              await trackWalletBet(env, wallet, {
+                signalId: signal.id,
+                market: signal.marketTitle,
+                direction: signal.direction,
+                amount: analysis.largestBet,
+                price: analysis.avgPrice
+              });
+            }
           }
         }
       }
@@ -213,7 +256,7 @@ export async function runScan(hours, minScore, env, options = {}) {
       }
     }
     
-    // Dedupe by marketSlug
+    // Dedupe
     const dedupedMap = new Map();
     for (const signal of allSignals) {
       const existing = dedupedMap.get(signal.marketSlug);
@@ -228,7 +271,7 @@ export async function runScan(hours, minScore, env, options = {}) {
     
     const result = {
       success: true,
-      version: "18.4.7",
+      version: "18.4.8",
       scanTime: Date.now() - startTime,
       tradesAnalyzed: recentTrades.length,
       marketsAnalyzed: Object.keys(marketGroups).length,
@@ -238,20 +281,21 @@ export async function runScan(hours, minScore, env, options = {}) {
       totalVolumeTracked: Math.round(totalVolumeTracked),
       signals: allSignals.slice(0, 50),
       mode: sportsOnly ? 'sports-games-only' : 'all-markets',
-      apiStats  // NEW: Shows what we got from Polymarket API
+      apiStats
     };
     
     if (sportsOnly) {
       result.filtered = {
         skippedFutures,
         skippedNonSports,
-        skippedStarted,
         gamesAnalyzed: Object.keys(marketGroups).length
       };
     }
     
     if (includeDebug) {
-      result.debug = debugInfo.slice(0, 100);
+      result.debug = debugInfo
+        .sort((a, b) => b.volume - a.volume)  // Sort by volume to see biggest markets
+        .slice(0, 100);
       result.skippedReasons = skippedReasons;
     }
     
@@ -272,12 +316,11 @@ function analyzeMarket(market) {
   
   let score = 0;
   const factors = [];
-  let skippedReason = null;
   
-  // Track prices and directions
   let largestBet = 0;
   let largestBetDirection = null;
   let largestBetPrice = 0;
+  let largestBetWallet = null;
   
   const directionData = {};
   const tradesList = [];
@@ -286,7 +329,7 @@ function analyzeMarket(market) {
     const rawPrice = parseFloat(trade.price || 0);
     const size = parseFloat(trade.size || 0);
     const direction = trade.outcome || trade.side || 'unknown';
-    const wallet = trade.maker || trade.taker || 'unknown';
+    const wallet = extractWallet(trade);
     const timestamp = trade.timestamp ? new Date(trade.timestamp * 1000).toISOString() : new Date().toISOString();
     
     const normalizedPrice = normalizeToYesPrice(rawPrice, direction);
@@ -295,6 +338,7 @@ function analyzeMarket(market) {
       largestBet = size;
       largestBetDirection = direction;
       largestBetPrice = rawPrice;
+      largestBetWallet = wallet;
     }
     
     if (!directionData[direction]) {
@@ -305,7 +349,7 @@ function analyzeMarket(market) {
     directionData[direction].count += 1;
     
     tradesList.push({
-      wallet,
+      wallet: wallet || 'unknown',
       amount: size,
       price: Math.round(normalizedPrice * 100),
       direction,
@@ -339,19 +383,13 @@ function analyzeMarket(market) {
   const displayPrice = Math.round(normalizedEntryPrice * 100);
   const avgEntryPrice = displayPrice;
   
-  // REMOVED: hasEventStarted check that was filtering too aggressively
-  // The extreme price check (>95 or <5) was filtering legitimate bets
-  // We'll let the frontend handle displaying "started" status instead
-  
-  // Only skip if the event date is clearly in the past
+  // Only skip if event date is clearly past
   const dateMatch = (market.slug || '').match(/(\d{4})-(\d{2})-(\d{2})/);
   if (dateMatch) {
     const eventDate = new Date(dateMatch[0]);
     const now = new Date();
-    // Only skip if event date is more than 1 day ago
     if (eventDate < new Date(now.getTime() - 24 * 60 * 60 * 1000)) {
-      skippedReason = 'event_in_past';
-      return { score: 0, factors: [], direction: dominantDirection, avgPrice: displayPrice, entryPrice: avgEntryPrice, largestBet, topTrades: [], skippedReason };
+      return { score: 0, factors: [], direction: dominantDirection, avgPrice: displayPrice, entryPrice: avgEntryPrice, largestBet, topTrades: [], skippedReason: 'event_past' };
     }
   }
   
@@ -371,6 +409,10 @@ function analyzeMarket(market) {
   } else if (largestBet >= 3000) {
     score += SCORES.WHALE_BET_SMALL;
     factors.push({ name: 'whaleSize3k', score: SCORES.WHALE_BET_SMALL, detail: `$${Math.round(largestBet/1000)}k bet` });
+  } else if (largestBet >= 1000) {
+    // NEW: Lower tier for $1k+ bets
+    score += 5;
+    factors.push({ name: 'whaleSize1k', score: 5, detail: `$${Math.round(largestBet/1000)}k bet` });
   }
   
   // SCORING: Volume
@@ -383,6 +425,10 @@ function analyzeMarket(market) {
   } else if (totalVolume >= 20000) {
     score += SCORES.VOLUME_MODERATE;
     factors.push({ name: 'volumeModerate', score: SCORES.VOLUME_MODERATE, detail: `$${Math.round(totalVolume/1000)}k volume` });
+  } else if (totalVolume >= 5000) {
+    // NEW: Lower tier for moderate volume
+    score += 3;
+    factors.push({ name: 'volumeLight', score: 3, detail: `$${Math.round(totalVolume/1000)}k volume` });
   }
   
   // SCORING: Extreme odds
@@ -401,15 +447,20 @@ function analyzeMarket(market) {
   }
   
   // SCORING: Concentration
-  if (wallets.size === 1 && largestBet >= 10000) {
+  const walletCount = wallets.size || 1;
+  if (walletCount === 1 && largestBet >= 10000) {
     score += SCORES.CONCENTRATION_SINGLE_WHALE;
     factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_SINGLE_WHALE, detail: 'Single whale dominance' });
-  } else if (wallets.size <= 2 && largestBet >= 5000) {
+  } else if (walletCount <= 2 && largestBet >= 5000) {
     score += SCORES.CONCENTRATION_WHALE_DUO;
     factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_WHALE_DUO, detail: 'Whale duo' });
-  } else if (wallets.size <= 3 && largestBet >= 5000) {
+  } else if (walletCount <= 3 && largestBet >= 5000) {
     score += SCORES.CONCENTRATION_HIGH;
     factors.push({ name: 'concentrated', score: SCORES.CONCENTRATION_HIGH, detail: 'High concentration' });
+  } else if (walletCount === 1 && largestBet >= 1000) {
+    // NEW: Lower tier for single wallet with decent bet
+    score += 5;
+    factors.push({ name: 'singleWallet', score: 5, detail: 'Single wallet activity' });
   }
   
   return {
@@ -420,8 +471,7 @@ function analyzeMarket(market) {
     entryPrice: avgEntryPrice,
     largestBet,
     isNoBet: dominantIsNoBet,
-    topTrades,
-    skippedReason
+    topTrades
   };
 }
 
