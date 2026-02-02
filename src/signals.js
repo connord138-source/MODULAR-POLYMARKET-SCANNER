@@ -1,0 +1,599 @@
+// ============================================================
+// SIGNALS.JS - Signal Detection and Scoring
+// v18.9.0 - WINNING FOCUS: Track winners, prioritize sports props
+// ============================================================
+
+import { POLYMARKET_API, SCORES, KV_KEYS } from './config.js';
+import { detectMarketType, generateId, isSportsGame } from './utils.js';
+import { trackWalletBet } from './wallets.js';
+import { calculateConfidence } from './learning.js';
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+const CONFIG = {
+  SCAN_CACHE_TTL: 2 * 60,        // 2 minutes cache
+  TRADE_LIMIT: 1500,              // API fetch limit
+  MAX_TRADES_PER_MARKET: 10,      // Memory optimization
+  SPORTS_SIGNAL_LIMIT: 15,        // Top 15 sports props
+  MIN_WALLET_WIN_RATE: 55,        // Only track wallets above 55% win rate
+  MIN_WALLET_BETS: 3,             // Minimum bets before tracking
+};
+
+// ============================================================
+// SCAN RESULT CACHE
+// ============================================================
+async function getCachedScanResult(env, cacheKey) {
+  if (!env.SIGNALS_CACHE) return null;
+  
+  try {
+    const cached = await env.SIGNALS_CACHE.get(cacheKey, { type: 'json' });
+    if (cached && cached.timestamp) {
+      const age = Date.now() - cached.timestamp;
+      if (age < CONFIG.SCAN_CACHE_TTL * 1000) {
+        return { ...cached.data, fromCache: true, cacheAge: Math.round(age / 1000) };
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+async function cacheScanResult(env, cacheKey, data) {
+  if (!env.SIGNALS_CACHE) return;
+  try {
+    await env.SIGNALS_CACHE.put(cacheKey, JSON.stringify({
+      data,
+      timestamp: Date.now()
+    }), { expirationTtl: CONFIG.SCAN_CACHE_TTL + 60 });
+  } catch (e) {}
+}
+
+// ============================================================
+// FILTERS
+// ============================================================
+const GAMBLING_KEYWORDS = [
+  'up or down', 'bitcoin up or down', 'ethereum up or down', 
+  '15m', '30m', '1h', '5m', 'next 15 minutes', 'next 30 minutes'
+];
+
+function isGamblingMarket(title) {
+  if (!title) return false;
+  const lower = title.toLowerCase();
+  return GAMBLING_KEYWORDS.some(kw => lower.includes(kw));
+}
+
+function extractWallet(trade) {
+  const wallet = trade.proxyWallet || trade.user || trade.maker || trade.taker;
+  return (wallet && typeof wallet === 'string' && wallet.length > 10) ? wallet : null;
+}
+
+function isNoBetOutcome(outcome) {
+  if (!outcome) return false;
+  const lower = String(outcome).toLowerCase();
+  return lower === 'no' || lower === 'false' || lower === '0';
+}
+
+// ============================================================
+// WINNING WALLET LOOKUP (Check if wallet is a proven winner)
+// ============================================================
+async function getWinningWallets(env) {
+  if (!env.SIGNALS_CACHE) return new Map();
+  
+  try {
+    const cached = await env.SIGNALS_CACHE.get('winning_wallets_cache', { type: 'json' });
+    if (cached && cached.timestamp && (Date.now() - cached.timestamp < 5 * 60 * 1000)) {
+      return new Map(Object.entries(cached.wallets || {}));
+    }
+  } catch (e) {}
+  
+  return new Map();
+}
+
+async function isWinningWallet(env, address, winningWalletsCache) {
+  if (!address) return { isWinner: false };
+  
+  // Check cache first
+  if (winningWalletsCache.has(address.toLowerCase())) {
+    return winningWalletsCache.get(address.toLowerCase());
+  }
+  
+  // Not in cache, check KV directly
+  if (!env.SIGNALS_CACHE) return { isWinner: false };
+  
+  try {
+    const walletKey = KV_KEYS.WALLETS_PREFIX + address.toLowerCase();
+    const stats = await env.SIGNALS_CACHE.get(walletKey, { type: 'json' });
+    
+    if (stats && stats.totalBets >= CONFIG.MIN_WALLET_BETS) {
+      const winRate = stats.winRate || (stats.totalBets > 0 ? (stats.wins / stats.totalBets) * 100 : 0);
+      if (winRate >= CONFIG.MIN_WALLET_WIN_RATE) {
+        return {
+          isWinner: true,
+          winRate: Math.round(winRate),
+          record: `${stats.wins}W-${stats.losses}L`,
+          tier: stats.tier || 'WINNER',
+          totalBets: stats.totalBets
+        };
+      }
+    }
+  } catch (e) {}
+  
+  return { isWinner: false };
+}
+
+// ============================================================
+// SIGNAL STORAGE (Only store signals with potential)
+// ============================================================
+async function storeSignalForSettlement(env, signal) {
+  if (!env.SIGNALS_CACHE || !signal.id) return false;
+  
+  try {
+    const signalKey = KV_KEYS.SIGNALS_PREFIX + signal.id;
+    
+    const signalData = {
+      id: signal.id,
+      marketSlug: signal.marketSlug,
+      marketTitle: signal.marketTitle,
+      direction: signal.direction,
+      priceAtSignal: signal.displayPrice,
+      score: signal.score,
+      confidence: signal.confidence,
+      detectedAt: new Date().toISOString(),
+      marketType: signal.marketType,
+      totalVolume: signal.suspiciousVolume,
+      largestBet: signal.largestBet,
+      scoreBreakdown: signal.scoreBreakdown || [],
+      wallets: signal.topTrades?.map(t => t.wallet).filter(Boolean) || [],
+      hasWinningWallet: signal.hasWinningWallet || false,
+      outcome: null,
+      settledAt: null
+    };
+    
+    await env.SIGNALS_CACHE.put(signalKey, JSON.stringify(signalData), {
+      expirationTtl: 7 * 24 * 60 * 60
+    });
+    
+    // Add to pending signals list
+    let pendingSignals = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: 'json' }) || [];
+    if (!pendingSignals.includes(signal.id)) {
+      pendingSignals.push(signal.id);
+      if (pendingSignals.length > 300) pendingSignals = pendingSignals.slice(-300);
+      await env.SIGNALS_CACHE.put(KV_KEYS.PENDING_SIGNALS, JSON.stringify(pendingSignals), {
+        expirationTtl: 30 * 24 * 60 * 60
+      });
+    }
+    
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Only track wallets that show promise (large bets or part of winning signal)
+async function trackWalletIfWorthy(env, wallet, tradeData, signal) {
+  if (!env.SIGNALS_CACHE || !wallet) return false;
+  
+  // Track if: large bet (>$5k) OR signal score is high (>60) OR has winning wallet pattern
+  const isWorthy = tradeData.amount >= 5000 || signal.score >= 60 || signal.hasWinningWallet;
+  
+  if (isWorthy) {
+    try {
+      await trackWalletBet(env, wallet, {
+        signalId: signal.id,
+        market: signal.marketSlug,
+        direction: signal.direction,
+        amount: tradeData.amount,
+        price: tradeData.price
+      });
+      return true;
+    } catch (e) {}
+  }
+  return false;
+}
+
+// ============================================================
+// MAIN SCAN FUNCTION
+// ============================================================
+export async function runScan(hours, minScore, env, options = {}) {
+  const startTime = Date.now();
+  const { sportsOnly = false, includeDebug = false } = options;
+  
+  const cacheKey = `scan_result_${hours}_${minScore}_${sportsOnly ? 'sports' : 'all'}`;
+  
+  // Try cache first
+  const cached = await getCachedScanResult(env, cacheKey);
+  if (cached) {
+    console.log(`Returning cached scan (age: ${cached.cacheAge}s)`);
+    return cached;
+  }
+  
+  try {
+    // Load winning wallets cache for quick lookup
+    const winningWallets = await getWinningWallets(env);
+    console.log(`Loaded ${winningWallets.size} winning wallets from cache`);
+    
+    // Fetch trades from API (skip KV buckets to save memory)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    
+    let allTrades = [];
+    try {
+      const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=${CONFIG.TRADE_LIMIT}`, {
+        signal: controller.signal
+      });
+      if (tradesRes.ok) {
+        allTrades = await tradesRes.json();
+        console.log(`Fetched ${allTrades.length} trades from API`);
+      }
+    } catch (e) {
+      return { success: true, signals: [], totalSignals: 0, message: 'Trade fetch failed', processingTime: Date.now() - startTime };
+    } finally {
+      clearTimeout(timeout);
+    }
+    
+    if (!allTrades || allTrades.length === 0) {
+      return { success: true, signals: [], totalSignals: 0, message: 'No trades', processingTime: Date.now() - startTime };
+    }
+    
+    // DEBUG: Log first trade to see structure
+    if (allTrades.length > 0) {
+      console.log('Sample trade structure:', JSON.stringify(allTrades[0]).slice(0, 500));
+    }
+    
+    const cutoffTime = Date.now() - (hours * 60 * 60 * 1000);
+    
+    // DEBUG counters
+    let debugStats = {
+      total: allTrades.length,
+      noTitle: 0,
+      gambling: 0,
+      noTimestamp: 0,
+      oldTrade: 0,
+      badPrice: 0,
+      tooSmall: 0,
+      noSlug: 0,
+      passed: 0
+    };
+    
+    // Group trades by market
+    const marketMap = new Map();
+    
+    for (const t of allTrades) {
+      const marketTitle = t.title || t.market || t.question || '';
+      if (!marketTitle) { debugStats.noTitle++; }
+      if (isGamblingMarket(marketTitle)) { debugStats.gambling++; continue; }
+      
+      let tradeTime = t.timestamp || t.createdAt || t.matchTime;
+      if (typeof tradeTime === 'string') tradeTime = new Date(tradeTime).getTime();
+      if (tradeTime && tradeTime < 1e10) tradeTime = tradeTime * 1000;
+      if (!tradeTime) { debugStats.noTimestamp++; continue; }
+      if (tradeTime < cutoffTime) { debugStats.oldTrade++; continue; }
+      
+      const price = parseFloat(t.price) || 0;
+      if (price >= 0.95 || price <= 0.05) { debugStats.badPrice++; continue; }
+      
+      let usdValue = parseFloat(t.usd_value) || parseFloat(t.usdcSize) || parseFloat(t.size) || parseFloat(t.amount) || 0;
+      if (usdValue < 10) { debugStats.tooSmall++; continue; }
+      
+      const slug = t.slug || t.eventSlug || t.market_slug || t.conditionId || '';
+      if (sportsOnly && !isSportsGame(slug) && !isSportsGame(marketTitle)) continue;
+      
+      const marketKey = slug || marketTitle;
+      if (!marketKey) { debugStats.noSlug++; continue; }
+      
+      debugStats.passed++;
+      
+      if (!marketMap.has(marketKey)) {
+        marketMap.set(marketKey, {
+          slug: marketKey,
+          eventSlug: t.eventSlug,
+          title: t.title,
+          icon: t.icon,
+          trades: [],
+          wallets: new Set(),
+          totalVolume: 0,
+          largestBet: 0,
+          firstTradeTime: tradeTime,
+          lastTradeTime: tradeTime,
+          yesVolume: 0,
+          noVolume: 0
+        });
+      }
+      
+      const market = marketMap.get(marketKey);
+      
+      // Keep top trades only (memory optimization)
+      if (market.trades.length < CONFIG.MAX_TRADES_PER_MARKET) {
+        market.trades.push({ 
+          _usdValue: usdValue, 
+          _tradeTime: tradeTime,
+          price: t.price,
+          outcome: t.outcome,
+          proxyWallet: t.proxyWallet
+        });
+      }
+      
+      market.totalVolume += usdValue;
+      market.largestBet = Math.max(market.largestBet, usdValue);
+      market.firstTradeTime = Math.min(market.firstTradeTime, tradeTime);
+      market.lastTradeTime = Math.max(market.lastTradeTime, tradeTime);
+      
+      const wallet = extractWallet(t);
+      if (wallet) market.wallets.add(wallet);
+      
+      if (isNoBetOutcome(t.outcome)) {
+        market.noVolume += usdValue;
+      } else {
+        market.yesVolume += usdValue;
+      }
+    }
+    
+    console.log(`Grouped into ${marketMap.size} markets`);
+    
+    // Score markets and build signals
+    const allSignals = [];
+    const sportsSignals = [];
+    let signalsStored = 0;
+    let walletsTracked = 0;
+    
+    for (const [slug, market] of marketMap) {
+      const score = calculateSignalScore(market);
+      if (score < minScore) continue;
+      
+      market.trades.sort((a, b) => b._usdValue - a._usdValue);
+      
+      // Check for winning wallets in this market
+      let hasWinningWallet = false;
+      let winningWalletInfo = null;
+      
+      const topTrades = [];
+      for (const t of market.trades.slice(0, 5)) {
+        const wallet = extractWallet(t);
+        const walletCheck = await isWinningWallet(env, wallet, winningWallets);
+        
+        if (walletCheck.isWinner) {
+          hasWinningWallet = true;
+          winningWalletInfo = { wallet, ...walletCheck };
+        }
+        
+        topTrades.push({
+          wallet,
+          amount: Math.round(t._usdValue),
+          price: t.price,
+          time: new Date(t._tradeTime).toISOString(),
+          outcome: t.outcome,
+          isWinner: walletCheck.isWinner,
+          winnerInfo: walletCheck.isWinner ? walletCheck : null
+        });
+      }
+      
+      const direction = market.yesVolume > market.noVolume ? 'YES' : 'NO';
+      const directionPercent = Math.round((Math.max(market.yesVolume, market.noVolume) / market.totalVolume) * 100);
+      const displayPrice = market.trades[0] ? Math.round(parseFloat(market.trades[0].price) * 100) : null;
+      const marketType = detectMarketType(market.title || slug, slug);
+      const scoreBreakdown = getScoreBreakdown(market, displayPrice, hasWinningWallet);
+      
+      // Calculate confidence with winning wallet boost
+      let confidence = Math.round(50 + (score / 100) * 25);
+      
+      // BOOST: Winning wallet adds 10-15% confidence
+      if (hasWinningWallet && winningWalletInfo) {
+        const walletBoost = Math.min(15, Math.round((winningWalletInfo.winRate - 50) / 3));
+        confidence += walletBoost;
+      }
+      
+      // AI learning enhancement
+      try {
+        if (typeof calculateConfidence === 'function' && env.SIGNALS_CACHE) {
+          const factorNames = [...scoreBreakdown.map(f => f.factor), marketType];
+          if (hasWinningWallet) factorNames.push('winningWallet');
+          
+          const confResult = await calculateConfidence(env, factorNames, {
+            marketType,
+            totalVolume: market.totalVolume,
+            detectedAt: new Date(market.firstTradeTime).toISOString()
+          });
+          
+          if (confResult && typeof confResult.confidence === 'number' && confResult.dataPoints >= 1) {
+            confidence = Math.round(confResult.confidence * 0.6 + confidence * 0.4);
+          }
+        }
+      } catch (e) {}
+      
+      confidence = Math.max(40, Math.min(95, Math.round(confidence)));
+      
+      const signal = {
+        id: generateId(),
+        marketSlug: slug,
+        marketTitle: market.title || slug,
+        icon: market.icon,
+        score,
+        confidence,
+        direction,
+        directionPercent,
+        displayPrice,
+        suspiciousVolume: Math.round(market.totalVolume),
+        largestBet: Math.round(market.largestBet),
+        uniqueWallets: market.wallets.size,
+        tradeCount: market.trades.length,
+        firstTradeTime: new Date(market.firstTradeTime).toISOString(),
+        lastTradeTime: new Date(market.lastTradeTime).toISOString(),
+        topTrades,
+        hasWinningWallet,
+        winningWalletInfo,
+        marketType,
+        scoreBreakdown,
+        // Priority flag for sports
+        isSportsSignal: marketType.startsWith('sports-')
+      };
+      
+      allSignals.push(signal);
+      
+      // Separate sports signals for priority handling
+      if (signal.isSportsSignal) {
+        sportsSignals.push(signal);
+      }
+      
+      // Store signal
+      try {
+        if (await storeSignalForSettlement(env, signal)) signalsStored++;
+      } catch (e) {}
+      
+      // Track worthy wallets only
+      for (const trade of topTrades.slice(0, 3)) {
+        if (trade.wallet) {
+          try {
+            if (await trackWalletIfWorthy(env, trade.wallet, trade, signal)) walletsTracked++;
+          } catch (e) {}
+        }
+      }
+    }
+    
+    // Clear map to free memory
+    marketMap.clear();
+    
+    // Sort all signals by score
+    allSignals.sort((a, b) => {
+      // Winning wallet signals first
+      if (a.hasWinningWallet && !b.hasWinningWallet) return -1;
+      if (!a.hasWinningWallet && b.hasWinningWallet) return 1;
+      // Then by score
+      return b.score - a.score;
+    });
+    
+    // Sort sports signals separately and ensure top 15
+    sportsSignals.sort((a, b) => {
+      if (a.hasWinningWallet && !b.hasWinningWallet) return -1;
+      if (!a.hasWinningWallet && b.hasWinningWallet) return 1;
+      return b.score - a.score;
+    });
+    
+    const result = {
+      success: true,
+      signals: allSignals,
+      sportsSignals: sportsSignals.slice(0, CONFIG.SPORTS_SIGNAL_LIMIT),
+      totalSignals: allSignals.length,
+      sportsSignalCount: sportsSignals.length,
+      signalsWithWinners: allSignals.filter(s => s.hasWinningWallet).length,
+      tradesProcessed: allTrades.length,
+      tradesSource: 'api',
+      signalsStored,
+      walletsTracked,
+      winningWalletsInCache: winningWallets.size,
+      processingTime: Date.now() - startTime,
+      marketsFound: marketMap.size,
+      debug: includeDebug ? debugStats : undefined
+    };
+    
+    await cacheScanResult(env, cacheKey, result);
+    
+    return result;
+    
+  } catch (e) {
+    console.error('Scan error:', e);
+    return { success: false, error: e.message, processingTime: Date.now() - startTime };
+  }
+}
+
+// ============================================================
+// SCORING
+// ============================================================
+function calculateSignalScore(market) {
+  let score = 0;
+  
+  // Whale bet size
+  if (market.largestBet >= 100000) score += 80;
+  else if (market.largestBet >= 50000) score += 60;
+  else if (market.largestBet >= 25000) score += 45;
+  else if (market.largestBet >= 10000) score += 30;
+  else if (market.largestBet >= 5000) score += 15;
+  
+  // Concentration
+  const walletCount = market.wallets.size;
+  if (walletCount === 1 && market.totalVolume >= 10000) score += 25;
+  else if (walletCount <= 2 && market.totalVolume >= 20000) score += 15;
+  else if (walletCount <= 5 && market.totalVolume >= 30000) score += 10;
+  
+  // Volume
+  if (market.totalVolume >= 500000) score += 25;
+  else if (market.totalVolume >= 100000) score += 15;
+  else if (market.totalVolume >= 50000) score += 8;
+  
+  // One-sided action
+  const dominantPercent = Math.max(market.yesVolume, market.noVolume) / market.totalVolume;
+  if (dominantPercent >= 0.90) score += 15;
+  else if (dominantPercent >= 0.80) score += 10;
+  
+  return Math.min(100, Math.round(score));
+}
+
+function getScoreBreakdown(market, displayPrice = 50, hasWinningWallet = false) {
+  const breakdown = [];
+  
+  // Whale size
+  if (market.largestBet >= 100000) breakdown.push({ factor: 'whaleSize100k', points: 80 });
+  else if (market.largestBet >= 50000) breakdown.push({ factor: 'whaleSize50k', points: 60 });
+  else if (market.largestBet >= 25000) breakdown.push({ factor: 'whaleSize25k', points: 45 });
+  else if (market.largestBet >= 15000) breakdown.push({ factor: 'whaleSize15k', points: 30 });
+  else if (market.largestBet >= 8000) breakdown.push({ factor: 'whaleSize8k', points: 20 });
+  else if (market.largestBet >= 5000) breakdown.push({ factor: 'whaleSize5k', points: 15 });
+  else if (market.largestBet >= 3000) breakdown.push({ factor: 'whaleSize3k', points: 10 });
+  
+  // Concentration
+  const walletCount = market.wallets.size;
+  if (walletCount === 1 && market.totalVolume >= 10000) breakdown.push({ factor: 'concentrated', points: 25 });
+  else if (walletCount <= 2 && market.totalVolume >= 20000) breakdown.push({ factor: 'concentrated', points: 15 });
+  
+  // Volume
+  if (market.totalVolume >= 500000) breakdown.push({ factor: 'volumeHuge', points: 25 });
+  else if (market.totalVolume >= 100000) breakdown.push({ factor: 'vol_100k_plus', points: 20 });
+  else if (market.totalVolume >= 50000) breakdown.push({ factor: 'vol_50k_100k', points: 15 });
+  else if (market.totalVolume >= 25000) breakdown.push({ factor: 'vol_25k_50k', points: 12 });
+  else if (market.totalVolume >= 10000) breakdown.push({ factor: 'vol_10k_25k', points: 10 });
+  else breakdown.push({ factor: 'vol_under_10k', points: 5 });
+  
+  // Odds factors
+  const price = displayPrice || 50;
+  if (price <= 15 || price >= 85) breakdown.push({ factor: 'extremeOdds', points: 35 });
+  else if (price <= 25) breakdown.push({ factor: 'moderateLongshot', points: 15 });
+  else if (price >= 75) breakdown.push({ factor: 'moderateFavorite', points: 10 });
+  
+  // WINNING WALLET FACTOR (high value!)
+  if (hasWinningWallet) {
+    breakdown.push({ factor: 'winningWallet', points: 30 });
+  }
+  
+  return breakdown;
+}
+
+// ============================================================
+// HELPER EXPORTS
+// ============================================================
+export async function getRecentSignals(env, limit = 20) {
+  const cached = await getCachedScanResult(env, 'scan_result_48_40_all');
+  if (cached && cached.signals) return cached.signals.slice(0, limit);
+  const result = await runScan(24, 30, env, { sportsOnly: false });
+  return result.signals?.slice(0, limit) || [];
+}
+
+export async function getSignal(env, signalId) {
+  const cached = await getCachedScanResult(env, 'scan_result_48_40_all');
+  if (cached && cached.signals) return cached.signals.find(s => s.id === signalId);
+  return null;
+}
+
+export async function getPendingSignalsCount(env) {
+  if (!env.SIGNALS_CACHE) return 0;
+  try {
+    const pending = await env.SIGNALS_CACHE.get(KV_KEYS.PENDING_SIGNALS, { type: 'json' }) || [];
+    return pending.length;
+  } catch (e) { return 0; }
+}
+
+export async function getTrackedWalletsCount(env) {
+  if (!env.SIGNALS_CACHE) return 0;
+  try {
+    const index = await env.SIGNALS_CACHE.get('tracked_wallet_index', { type: 'json' }) || [];
+    return index.length;
+  } catch (e) { return 0; }
+}
