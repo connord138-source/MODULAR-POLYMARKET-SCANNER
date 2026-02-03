@@ -785,6 +785,150 @@ export function matchPolyToVegas(polySlug, vegasHomeTeam, vegasAwayTeam, vegasDa
 }
 
 // ============================================================
+// EVENT TIMING LOOKUP
+// Enriches signals with event start/end times from Gamma API
+// ============================================================
+
+/**
+ * Get event timing (start/end) for a market slug
+ * Uses Gamma API events endpoint with aggressive caching
+ * Returns { eventStartTime, eventEndTime, hoursUntilEvent } or null
+ */
+export async function getEventTimingBySlug(env, slug) {
+  if (!slug) return null;
+  
+  // Step 1: Try slug-specific cache first (fast path)
+  const timingCacheKey = `event_timing_${slug}`;
+  if (env.SIGNALS_CACHE) {
+    try {
+      const cached = await env.SIGNALS_CACHE.get(timingCacheKey, { type: 'json' });
+      if (cached) return cached;
+    } catch (e) {}
+  }
+  
+  // Step 2: Extract date from slug for estimation
+  const dateMatch = slug.match(/(\d{4})-(\d{2})-(\d{2})/);
+  
+  // Step 3: Try Gamma API direct slug lookup
+  let timing = null;
+  try {
+    const response = await fetch(`${GAMMA_API}/events?slug=${slug}&limit=1`);
+    if (response.ok) {
+      const events = await response.json();
+      if (events && events.length > 0) {
+        const event = events[0];
+        timing = {
+          eventStartTime: event.startDate || null,
+          eventEndTime: event.endDate || null,
+          source: 'gamma-event'
+        };
+      }
+    }
+  } catch (e) {
+    // Gamma lookup failed, fall through to estimation
+  }
+  
+  // Step 4: If no Gamma event found, try market lookup for endDate
+  if (!timing) {
+    try {
+      const response = await fetch(`${GAMMA_API}/markets?slug=${slug}&limit=1`);
+      if (response.ok) {
+        const markets = await response.json();
+        if (markets && markets.length > 0) {
+          const market = markets[0];
+          timing = {
+            eventStartTime: null,
+            eventEndTime: market.endDate || null,
+            source: 'gamma-market'
+          };
+        }
+      }
+    } catch (e) {}
+  }
+  
+  // Step 5: Estimate from slug date if no API data
+  if (!timing && dateMatch) {
+    const eventDate = new Date(
+      parseInt(dateMatch[1]),
+      parseInt(dateMatch[2]) - 1,
+      parseInt(dateMatch[3])
+    );
+    
+    // Estimate game time based on sport type in slug
+    const slugLower = slug.toLowerCase();
+    let estimatedHour = 0; // UTC midnight = 7pm ET default
+    
+    if (slugLower.startsWith('nba-') || slugLower.startsWith('nhl-')) {
+      estimatedHour = 0; // ~7pm ET start typical
+    } else if (slugLower.startsWith('nfl-')) {
+      estimatedHour = 18; // ~1pm ET Sunday start typical
+    } else if (slugLower.startsWith('cbb-') || slugLower.startsWith('ncaab-')) {
+      estimatedHour = 23; // ~6pm ET typical
+    }
+    
+    eventDate.setUTCHours(estimatedHour, 0, 0, 0);
+    
+    // End time estimate: game start + 3 hours
+    const eventEndDate = new Date(eventDate.getTime() + 3 * 60 * 60 * 1000);
+    
+    timing = {
+      eventStartTime: eventDate.toISOString(),
+      eventEndTime: eventEndDate.toISOString(),
+      source: 'slug-estimate'
+    };
+  }
+  
+  if (!timing) return null;
+  
+  // Calculate hours until event
+  const startTime = timing.eventStartTime ? new Date(timing.eventStartTime).getTime() : null;
+  const endTime = timing.eventEndTime ? new Date(timing.eventEndTime).getTime() : null;
+  const now = Date.now();
+  
+  timing.hoursUntilEvent = startTime ? Math.round((startTime - now) / (1000 * 60 * 60) * 10) / 10 : null;
+  timing.hoursUntilEnd = endTime ? Math.round((endTime - now) / (1000 * 60 * 60) * 10) / 10 : null;
+  timing.eventStatus = startTime 
+    ? (now < startTime ? 'upcoming' : (endTime && now < endTime ? 'live' : 'ended'))
+    : 'unknown';
+  
+  // Cache for 10 minutes (event times don't change often)
+  if (env.SIGNALS_CACHE) {
+    try {
+      await env.SIGNALS_CACHE.put(timingCacheKey, JSON.stringify(timing), {
+        expirationTtl: 10 * 60
+      });
+    } catch (e) {}
+  }
+  
+  return timing;
+}
+
+/**
+ * Batch lookup event timing for multiple slugs (efficient for scan enrichment)
+ * Returns Map<slug, timing>
+ */
+export async function batchGetEventTiming(env, slugs) {
+  const timingMap = new Map();
+  
+  // Limit to prevent API hammering - only enrich top signals
+  const maxLookups = 20;
+  const lookupSlugs = slugs.slice(0, maxLookups);
+  
+  // Parallel lookups with individual error handling
+  const results = await Promise.allSettled(
+    lookupSlugs.map(slug => getEventTimingBySlug(env, slug))
+  );
+  
+  results.forEach((result, i) => {
+    if (result.status === 'fulfilled' && result.value) {
+      timingMap.set(lookupSlugs[i], result.value);
+    }
+  });
+  
+  return timingMap;
+}
+
+// ============================================================
 // EXPORTS
 // ============================================================
 
@@ -805,6 +949,10 @@ export default {
   
   // Data API
   getRecentTrades,
+  
+  // Event Timing
+  getEventTimingBySlug,
+  batchGetEventTiming,
   
   // Helpers
   matchPolyToVegas

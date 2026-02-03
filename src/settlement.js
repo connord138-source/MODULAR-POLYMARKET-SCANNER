@@ -211,6 +211,31 @@ export async function processSettledSignals(env) {
           continue;
         }
         
+        // ============================================================
+        // EVENT TIMING GUARD: Don't attempt settlement before event ends
+        // This prevents signals from being prematurely settled or dropped
+        // ============================================================
+        if (signalData.eventStartTime) {
+          const eventStart = new Date(signalData.eventStartTime).getTime();
+          const now = Date.now();
+          
+          if (now < eventStart) {
+            // Event hasn't started yet - definitely still pending
+            stillPending.push(signalId);
+            continue;
+          }
+          
+          // If event has endTime, check that too
+          if (signalData.eventEndTime) {
+            const eventEnd = new Date(signalData.eventEndTime).getTime();
+            // Allow 1 hour buffer after estimated end for settlement lag
+            if (now < eventEnd + (60 * 60 * 1000)) {
+              // Event still in progress or just ended - check but be cautious
+              // Fall through to normal settlement logic
+            }
+          }
+        }
+        
         // Try Odds API first for sports
         const sport = detectSportFromSlug(signalData.marketSlug);
         

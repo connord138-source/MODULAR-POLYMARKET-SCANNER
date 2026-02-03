@@ -7,6 +7,7 @@ import { POLYMARKET_API, SCORES, KV_KEYS } from './config.js';
 import { detectMarketType, generateId, isSportsGame } from './utils.js';
 import { trackWalletBet } from './wallets.js';
 import { calculateConfidence } from './learning.js';
+import { batchGetEventTiming } from './polymarket-api.js';
 
 // ============================================================
 // CONFIGURATION
@@ -264,6 +265,10 @@ async function storeSignalForSettlement(env, signal) {
       // FIX #5: Store timing metadata for learning
       firstTradeTime: signal.firstTradeTime || null,
       lastTradeTime: signal.lastTradeTime || null,
+      // Event timing: prevents premature settlement + keeps signals visible until event ends
+      eventStartTime: signal.eventStartTime || null,
+      eventEndTime: signal.eventEndTime || null,
+      hoursUntilEvent: signal.hoursUntilEvent || null,
       outcome: null,
       settledAt: null
     };
@@ -637,6 +642,35 @@ export async function runScan(hours, minScore, env, options = {}) {
     
     // Clear map to free memory
     marketMap.clear();
+    
+    // ============================================================
+    // ENRICH SIGNALS WITH EVENT TIMING (start/end times)
+    // Batch lookup from Gamma API with caching
+    // ============================================================
+    try {
+      const slugsToLookup = allSignals.map(s => s.marketSlug).filter(Boolean);
+      if (slugsToLookup.length > 0) {
+        const timingMap = await batchGetEventTiming(env, slugsToLookup);
+        
+        let enriched = 0;
+        for (const signal of allSignals) {
+          const timing = timingMap.get(signal.marketSlug);
+          if (timing) {
+            signal.eventStartTime = timing.eventStartTime;
+            signal.eventEndTime = timing.eventEndTime;
+            signal.hoursUntilEvent = timing.hoursUntilEvent;
+            signal.hoursUntilEnd = timing.hoursUntilEnd;
+            signal.eventStatus = timing.eventStatus;
+            signal.eventTimingSource = timing.source;
+            enriched++;
+          }
+        }
+        console.log(`Enriched ${enriched}/${allSignals.length} signals with event timing`);
+      }
+    } catch (e) {
+      console.error('Event timing enrichment error:', e.message);
+      // Non-fatal - signals still work without timing
+    }
     
     // Sort all signals by score
     allSignals.sort((a, b) => {
