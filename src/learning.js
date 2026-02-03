@@ -89,6 +89,9 @@ export async function trackSignalMetadata(env, signal, outcome) {
     // Track wallet count patterns
     await trackWalletCountPattern(env, signal.walletCount, outcome);
     
+    // Track event timing patterns (NEW - improvement #5)
+    await trackEventTiming(env, signal, outcome);
+    
     // Check for new pattern discoveries
     await discoverNewPatterns(env);
     
@@ -206,6 +209,61 @@ async function trackWalletCountPattern(env, walletCount, outcome) {
   
   const total = stats[pattern].wins + stats[pattern].losses;
   stats[pattern].winRate = Math.round((stats[pattern].wins / total) * 100);
+  
+  await env.SIGNALS_CACHE.put(LEARNING_KEYS.PATTERN_CANDIDATES, JSON.stringify(stats), {
+    expirationTtl: 90 * 24 * 60 * 60
+  });
+}
+
+/**
+ * IMPROVEMENT #5: Track event timing patterns
+ * How close to event start was the bet placed?
+ */
+async function trackEventTiming(env, signal, outcome) {
+  if (!signal.marketSlug && !signal.marketTitle) return;
+  
+  const slug = signal.marketSlug || '';
+  const dateMatch = slug.match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (!dateMatch) return; // Non-dated markets (politics, crypto) skip this
+  
+  const eventDate = new Date(
+    parseInt(dateMatch[1]),
+    parseInt(dateMatch[2]) - 1,
+    parseInt(dateMatch[3])
+  );
+  eventDate.setUTCHours(24, 0, 0, 0); // End of event date ≈ evening games
+  
+  // Use lastTradeTime if available, otherwise detectedAt
+  const betTime = signal.lastTradeTime 
+    ? new Date(signal.lastTradeTime).getTime()
+    : signal.detectedAt 
+      ? new Date(signal.detectedAt).getTime()
+      : null;
+  
+  if (!betTime || isNaN(betTime)) return;
+  
+  const hoursBeforeEvent = (eventDate.getTime() - betTime) / (1000 * 60 * 60);
+  
+  let timingFactor;
+  if (hoursBeforeEvent <= 0) timingFactor = 'betDuringEvent';
+  else if (hoursBeforeEvent <= 2) timingFactor = 'betLast2Hours';
+  else if (hoursBeforeEvent <= 6) timingFactor = 'betSameDay';
+  else if (hoursBeforeEvent <= 24) timingFactor = 'betDayBefore';
+  else if (hoursBeforeEvent <= 72) timingFactor = 'betEarlyDays';
+  else timingFactor = 'betVeryEarly';
+  
+  // Store in pattern_candidates for auto-discovery
+  let stats = await env.SIGNALS_CACHE.get(LEARNING_KEYS.PATTERN_CANDIDATES, { type: "json" }) || {};
+  
+  if (!stats[timingFactor]) {
+    stats[timingFactor] = { wins: 0, losses: 0, winRate: 50, category: "event_timing" };
+  }
+  
+  if (outcome === "WIN") stats[timingFactor].wins++;
+  else stats[timingFactor].losses++;
+  
+  const total = stats[timingFactor].wins + stats[timingFactor].losses;
+  stats[timingFactor].winRate = Math.round((stats[timingFactor].wins / total) * 100);
   
   await env.SIGNALS_CACHE.put(LEARNING_KEYS.PATTERN_CANDIDATES, JSON.stringify(stats), {
     expirationTtl: 90 * 24 * 60 * 60
@@ -362,6 +420,28 @@ export async function calculateConfidence(env, factors, signal = {}) {
             confidence: stats.winRate,
             weight: 0.5
           });
+        }
+      }
+    }
+    
+    // 5. Event timing confidence (NEW - how close to event)
+    const candidates = await env.SIGNALS_CACHE.get(LEARNING_KEYS.PATTERN_CANDIDATES, { type: "json" }) || {};
+    if (factors) {
+      const factorNames = factors.map(f => typeof f === 'object' ? (f.factor || f.name) : f).filter(Boolean);
+      const timingFactors = ['betDuringEvent', 'betLast2Hours', 'betSameDay', 'betDayBefore', 'betEarlyDays', 'betVeryEarly'];
+      
+      for (const tf of timingFactors) {
+        if (factorNames.includes(tf) && candidates[tf]) {
+          const stats = candidates[tf];
+          const total = (stats.wins || 0) + (stats.losses || 0);
+          if (total >= 5) {
+            components.push({
+              source: 'event_timing',
+              confidence: stats.winRate,
+              weight: 1.5  // Event timing is highly predictive
+            });
+            break; // Only one timing factor per signal
+          }
         }
       }
     }
@@ -550,6 +630,133 @@ export async function getAIRecommendation(env) {
     };
   } catch (e) {
     console.error("Error getting AI recommendation:", e.message);
+    return null;
+  }
+}
+
+// ============================================================
+// FACTOR COMBO TRACKING (NEW!)
+// ============================================================
+
+const COMBO_KEY = 'factor_combos_v1';
+
+/**
+ * Track factor combinations when a signal settles
+ * This helps identify which factor PAIRS perform best together
+ */
+export async function trackFactorCombo(env, factors, outcome) {
+  if (!env.SIGNALS_CACHE || !factors || factors.length < 2) return;
+  
+  try {
+    let combos = await env.SIGNALS_CACHE.get(COMBO_KEY, { type: 'json' }) || {};
+    
+    // Get unique factor names
+    const factorNames = factors.map(f => typeof f === 'object' ? (f.factor || f.name) : f).filter(Boolean);
+    
+    // Generate all 2-factor combinations
+    for (let i = 0; i < factorNames.length; i++) {
+      for (let j = i + 1; j < factorNames.length; j++) {
+        // Sort to ensure consistent key regardless of order
+        const combo = [factorNames[i], factorNames[j]].sort().join(' + ');
+        
+        if (!combos[combo]) {
+          combos[combo] = { 
+            wins: 0, 
+            losses: 0, 
+            winRate: 50,
+            factors: [factorNames[i], factorNames[j]].sort(),
+            lastUpdated: null
+          };
+        }
+        
+        if (outcome === 'WIN') combos[combo].wins++;
+        else combos[combo].losses++;
+        
+        const total = combos[combo].wins + combos[combo].losses;
+        combos[combo].winRate = Math.round((combos[combo].wins / total) * 100);
+        combos[combo].lastUpdated = new Date().toISOString();
+      }
+    }
+    
+    // Prune combos with very few samples to save space
+    const prunedCombos = {};
+    for (const [key, stats] of Object.entries(combos)) {
+      if ((stats.wins + stats.losses) >= 2) {  // Keep if at least 2 samples
+        prunedCombos[key] = stats;
+      }
+    }
+    
+    await env.SIGNALS_CACHE.put(COMBO_KEY, JSON.stringify(prunedCombos), {
+      expirationTtl: 90 * 24 * 60 * 60
+    });
+    
+    return prunedCombos;
+  } catch (e) {
+    console.error("Error tracking factor combo:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Get factor combo statistics
+ * Returns best and worst performing factor combinations
+ */
+export async function getFactorCombos(env) {
+  if (!env.SIGNALS_CACHE) return { combos: [], bestCombos: [], worstCombos: [] };
+  
+  try {
+    const combos = await env.SIGNALS_CACHE.get(COMBO_KEY, { type: 'json' }) || {};
+    
+    // Convert to array and filter for sufficient data
+    const comboArray = Object.entries(combos)
+      .map(([name, stats]) => ({ name, ...stats }))
+      .filter(c => (c.wins + c.losses) >= 3)  // At least 3 samples
+      .sort((a, b) => b.winRate - a.winRate);
+    
+    return {
+      combos: comboArray,
+      bestCombos: comboArray.filter(c => c.winRate >= 60).slice(0, 10),
+      worstCombos: comboArray.filter(c => c.winRate <= 40).slice(-10).reverse(),
+      totalTracked: Object.keys(combos).length
+    };
+  } catch (e) {
+    console.error("Error getting factor combos:", e.message);
+    return { combos: [], bestCombos: [], worstCombos: [] };
+  }
+}
+
+/**
+ * Check if a signal has a historically strong factor combo
+ */
+export async function hasStrongCombo(env, factors) {
+  if (!env.SIGNALS_CACHE || !factors || factors.length < 2) return null;
+  
+  try {
+    const combos = await env.SIGNALS_CACHE.get(COMBO_KEY, { type: 'json' }) || {};
+    const factorNames = factors.map(f => typeof f === 'object' ? (f.factor || f.name) : f).filter(Boolean);
+    
+    let bestCombo = null;
+    let bestWinRate = 0;
+    
+    // Check all 2-factor combinations in this signal
+    for (let i = 0; i < factorNames.length; i++) {
+      for (let j = i + 1; j < factorNames.length; j++) {
+        const combo = [factorNames[i], factorNames[j]].sort().join(' + ');
+        const stats = combos[combo];
+        
+        if (stats && (stats.wins + stats.losses) >= 5 && stats.winRate > bestWinRate) {
+          bestWinRate = stats.winRate;
+          bestCombo = {
+            combo,
+            winRate: stats.winRate,
+            record: `${stats.wins}W-${stats.losses}L`
+          };
+        }
+      }
+    }
+    
+    return bestCombo;
+  } catch (e) {
     return null;
   }
 }

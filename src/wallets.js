@@ -14,6 +14,69 @@ const KEEPER_THRESHOLDS = {
   INSIDER_WIN_RATE: 75,  // Insider threshold
 };
 
+// NBA/Sports team name mappings for readable titles
+const TEAM_ABBREVS = {
+  'lal': 'Lakers', 'lac': 'Clippers', 'gsw': 'Warriors', 'sac': 'Kings',
+  'phx': 'Suns', 'den': 'Nuggets', 'min': 'Timberwolves', 'okc': 'Thunder',
+  'por': 'Trail Blazers', 'uta': 'Jazz', 'dal': 'Mavericks', 'hou': 'Rockets',
+  'sas': 'Spurs', 'mem': 'Grizzlies', 'nop': 'Pelicans', 'bos': 'Celtics',
+  'bkn': 'Nets', 'nyk': 'Knicks', 'phi': 'Sixers', 'tor': 'Raptors',
+  'chi': 'Bulls', 'cle': 'Cavaliers', 'det': 'Pistons', 'ind': 'Pacers',
+  'mil': 'Bucks', 'atl': 'Hawks', 'cha': 'Hornets', 'mia': 'Heat',
+  'orl': 'Magic', 'was': 'Wizards', 'elc': 'Celtics', 'bar': 'Barcelona',
+  'bun': 'Bucks', 'dor': 'Dortmund', 'hei': 'Heat', 'cel': 'Celtics',
+  'hor': 'Hornets', 'pel': 'Pelicans'
+};
+
+// Format market title to be human-readable
+function formatMarketTitle(title) {
+  if (!title) return 'Unknown Market';
+  
+  // If it's already a readable title (contains spaces and no dates), return it
+  if (title.includes(' ') && !title.match(/^\w{3}\s\w{3}\s\w{3}\s\d{4}/)) {
+    return title;
+  }
+  
+  // Try to parse slug format: "lal-elc-bar-2026-01-31" or "lal elc bar 2026 01 31"
+  const parts = title.toLowerCase().replace(/-/g, ' ').split(' ').filter(p => p);
+  
+  // Extract date if present
+  let dateStr = '';
+  const dateMatch = title.match(/(\d{4})[-\s](\d{2})[-\s](\d{2})/);
+  if (dateMatch) {
+    const [, year, month, day] = dateMatch;
+    const date = new Date(year, parseInt(month) - 1, day);
+    dateStr = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
+  
+  // Try to identify team abbreviations and expand them
+  const teams = [];
+  for (const part of parts) {
+    if (part.length === 3 && TEAM_ABBREVS[part]) {
+      teams.push(TEAM_ABBREVS[part]);
+    } else if (part.length === 3 && /^[a-z]+$/.test(part)) {
+      // Unknown 3-letter abbrev, capitalize it
+      teams.push(part.toUpperCase());
+    }
+  }
+  
+  if (teams.length >= 2) {
+    // Format as "Team1 vs Team2 - Date"
+    const matchup = `${teams[0]} vs ${teams[1]}`;
+    return dateStr ? `${matchup} - ${dateStr}` : matchup;
+  }
+  
+  // Fallback: just clean up the title
+  return title
+    .replace(/-/g, ' ')
+    .replace(/\d{4}\s?\d{2}\s?\d{2}/g, '') // Remove dates
+    .split(' ')
+    .filter(w => w.length > 0)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ')
+    .trim() || 'Unknown Market';
+}
+
 // Get wallet tier based on performance
 export function getWalletTier(stats) {
   if (!stats) return null;
@@ -43,11 +106,12 @@ export function getWalletTier(stats) {
   return null;
 }
 
-// Track a new wallet bet
+// Track a new wallet bet with FULL individual trade data
 export async function trackWalletBet(env, walletAddress, betData) {
   if (!env.SIGNALS_CACHE || !walletAddress) return null;
   
   const key = KV_KEYS.WALLETS_PREFIX + walletAddress.toLowerCase();
+  const tradesKey = `wallet_trades_${walletAddress.toLowerCase()}`;
   
   try {
     let stats = await env.SIGNALS_CACHE.get(key, { type: "json" });
@@ -70,38 +134,59 @@ export async function trackWalletBet(env, walletAddress, betData) {
       };
     }
     
-    // Check for duplicate bet (same market + similar amount = same bet)
+    // Generate unique trade ID
+    const tradeId = `${betData.signalId || betData.market}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    
+    // Check for duplicate bet (same market + similar amount within 5 minutes)
+    const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
     const isDuplicate = stats.recentBets.some(existing => {
       const sameMarket = (existing.market || '').toLowerCase() === (betData.market || '').toLowerCase() ||
                          existing.signalId === betData.signalId;
-      const sameAmount = Math.abs((existing.amount || 0) - (betData.amount || 0)) < 10; // Within $10
-      return sameMarket && sameAmount;
+      const sameAmount = Math.abs((existing.amount || 0) - (betData.amount || 0)) < 10;
+      const recentEnough = new Date(existing.timestamp).getTime() > fiveMinutesAgo;
+      return sameMarket && sameAmount && recentEnough;
     });
     
     if (isDuplicate) {
       console.log(`Skipping duplicate bet for wallet ${walletAddress.slice(0,8)}... on ${betData.market}`);
-      return stats; // Return existing stats without adding duplicate
+      return stats;
     }
+    
+    // Create detailed trade record
+    const tradeRecord = {
+      id: tradeId,
+      signalId: betData.signalId,
+      market: betData.market,
+      marketTitle: betData.marketTitle || betData.market,
+      direction: betData.direction,
+      amount: betData.amount || 0,
+      price: betData.price || 0,
+      timestamp: new Date().toISOString(),
+      outcome: null,
+      settledAt: null,
+      // P&L tracking fields
+      invested: betData.amount || 0,
+      returned: 0,
+      pnl: 0,
+      roi: 0,
+      // Current value tracking (for open positions)
+      currentPrice: betData.price || 0,
+      currentValue: betData.amount || 0,
+      unrealizedPnl: 0
+    };
     
     stats.pending += 1;
     stats.totalVolume += betData.amount || 0;
     stats.lastBetAt = new Date().toISOString();
     
-    // Add new bet to recent bets (no duplicates now)
-    stats.recentBets.unshift({
-      signalId: betData.signalId,
-      market: betData.market,
-      direction: betData.direction,
-      amount: betData.amount,
-      price: betData.price,
-      timestamp: new Date().toISOString(),
-      outcome: null
-    });
-    
-    // Keep only last 10 recent bets (memory optimization)
-    if (stats.recentBets.length > 10) {
-      stats.recentBets = stats.recentBets.slice(0, 10);
+    // Add to recent bets (keep last 50 for display)
+    stats.recentBets.unshift(tradeRecord);
+    if (stats.recentBets.length > 50) {
+      stats.recentBets = stats.recentBets.slice(0, 50);
     }
+    
+    // ALSO store in separate trades storage (for full history)
+    await storeIndividualTrade(env, walletAddress, tradeRecord);
     
     await env.SIGNALS_CACHE.put(key, JSON.stringify(stats), {
       expirationTtl: 90 * 24 * 60 * 60
@@ -116,26 +201,91 @@ export async function trackWalletBet(env, walletAddress, betData) {
   }
 }
 
-// Record bet outcome
+// Store individual trade in separate KV for full history
+async function storeIndividualTrade(env, walletAddress, trade) {
+  if (!env.SIGNALS_CACHE) return;
+  
+  const tradesKey = `wallet_trades_${walletAddress.toLowerCase()}`;
+  
+  try {
+    let trades = await env.SIGNALS_CACHE.get(tradesKey, { type: 'json' }) || { 
+      open: [], 
+      resolved: [],
+      lastUpdated: null 
+    };
+    
+    // Add to open trades
+    trades.open.unshift(trade);
+    
+    // Keep last 100 open trades max
+    if (trades.open.length > 100) {
+      trades.open = trades.open.slice(0, 100);
+    }
+    
+    trades.lastUpdated = new Date().toISOString();
+    
+    await env.SIGNALS_CACHE.put(tradesKey, JSON.stringify(trades), {
+      expirationTtl: 180 * 24 * 60 * 60  // 6 months
+    });
+  } catch (e) {
+    console.error("Error storing individual trade:", e.message);
+  }
+}
+
+// Record bet outcome with FULL P&L calculation
 export async function recordWalletOutcome(env, walletAddress, outcome, profitLoss, marketType, betAmount, signalId) {
   if (!env.SIGNALS_CACHE || !walletAddress) return null;
   
   const key = KV_KEYS.WALLETS_PREFIX + walletAddress.toLowerCase();
+  const tradesKey = `wallet_trades_${walletAddress.toLowerCase()}`;
   
   try {
     let stats = await env.SIGNALS_CACHE.get(key, { type: "json" });
     if (!stats) return null;
     
-    // Update recent bet with outcome
-    if (signalId && stats.recentBets) {
+    // Calculate actual P&L based on outcome
+    // If WIN: returned = invested / price (shares bought), P&L = returned - invested
+    // If LOSS: returned = 0, P&L = -invested
+    let calculatedPnl = profitLoss || 0;
+    let returnedAmount = 0;
+    
+    // Find the bet in recentBets and update it
+    let betFound = false;
+    if (stats.recentBets) {
       for (let i = 0; i < stats.recentBets.length; i++) {
-        if (stats.recentBets[i].signalId === signalId && stats.recentBets[i].outcome === null) {
+        const bet = stats.recentBets[i];
+        if ((signalId && bet.signalId === signalId) || 
+            (bet.market && bet.market.toLowerCase().includes(signalId?.toLowerCase())) &&
+            bet.outcome === null) {
+          
+          const invested = bet.amount || betAmount || 0;
+          const entryPrice = bet.price || 0.5;
+          
+          if (outcome === "WIN") {
+            // Shares = invested / price, Return = shares * 1.0 (winning outcome pays $1)
+            const shares = invested / entryPrice;
+            returnedAmount = shares;
+            calculatedPnl = returnedAmount - invested;
+          } else if (outcome === "LOSS") {
+            returnedAmount = 0;
+            calculatedPnl = -invested;
+          }
+          
+          // Update the bet record with settlement info
           stats.recentBets[i].outcome = outcome;
           stats.recentBets[i].settledAt = new Date().toISOString();
+          stats.recentBets[i].returned = returnedAmount;
+          stats.recentBets[i].pnl = calculatedPnl;
+          stats.recentBets[i].roi = invested > 0 ? Math.round((calculatedPnl / invested) * 100) : 0;
+          
+          betFound = true;
           break;
         }
       }
     }
+    
+    // Also update in trades storage
+    await updateTradeOutcome(env, walletAddress, signalId, outcome, calculatedPnl, returnedAmount);
     
     stats.totalBets += 1;
     stats.pending = Math.max(0, stats.pending - 1);
@@ -149,7 +299,7 @@ export async function recordWalletOutcome(env, walletAddress, outcome, profitLos
       stats.currentStreak = Math.min(0, stats.currentStreak) - 1;
     }
     
-    stats.profitLoss += profitLoss || 0;
+    stats.profitLoss = (stats.profitLoss || 0) + calculatedPnl;
     stats.winRate = stats.totalBets > 0 ? Math.round((stats.wins / stats.totalBets) * 100) : 0;
     stats.tier = getWalletTier(stats)?.tier || null;
     
@@ -179,6 +329,52 @@ export async function recordWalletOutcome(env, walletAddress, outcome, profitLos
   }
 }
 
+// Update trade outcome in separate trades storage
+async function updateTradeOutcome(env, walletAddress, signalId, outcome, pnl, returned) {
+  if (!env.SIGNALS_CACHE) return;
+  
+  const tradesKey = `wallet_trades_${walletAddress.toLowerCase()}`;
+  
+  try {
+    let trades = await env.SIGNALS_CACHE.get(tradesKey, { type: 'json' });
+    if (!trades) return;
+    
+    // Find and move trade from open to resolved
+    const tradeIndex = trades.open.findIndex(t => 
+      t.signalId === signalId || 
+      (t.market && t.market.toLowerCase().includes(signalId?.toLowerCase()))
+    );
+    
+    if (tradeIndex >= 0) {
+      const trade = trades.open[tradeIndex];
+      
+      // Update trade with settlement info
+      trade.outcome = outcome;
+      trade.settledAt = new Date().toISOString();
+      trade.returned = returned;
+      trade.pnl = pnl;
+      trade.roi = trade.invested > 0 ? Math.round((pnl / trade.invested) * 100) : 0;
+      
+      // Move to resolved
+      trades.resolved.unshift(trade);
+      trades.open.splice(tradeIndex, 1);
+      
+      // Keep last 200 resolved trades
+      if (trades.resolved.length > 200) {
+        trades.resolved = trades.resolved.slice(0, 200);
+      }
+      
+      trades.lastUpdated = new Date().toISOString();
+      
+      await env.SIGNALS_CACHE.put(tradesKey, JSON.stringify(trades), {
+        expirationTtl: 180 * 24 * 60 * 60
+      });
+    }
+  } catch (e) {
+    console.error("Error updating trade outcome:", e.message);
+  }
+}
+
 // Evaluate if wallet should be kept
 function evaluateWalletForKeeping(stats) {
   // Always keep wallets with pending bets
@@ -200,6 +396,179 @@ function evaluateWalletForKeeping(stats) {
   }
   
   return false;
+}
+
+// ============================================================
+// GET WALLET P&L - Full trade history with calculations
+// ============================================================
+export async function getWalletPnL(env, walletAddress) {
+  if (!env.SIGNALS_CACHE || !walletAddress) {
+    return { success: false, error: "Invalid request" };
+  }
+  
+  const key = KV_KEYS.WALLETS_PREFIX + walletAddress.toLowerCase();
+  const tradesKey = `wallet_trades_${walletAddress.toLowerCase()}`;
+  
+  try {
+    // Get wallet stats
+    const stats = await env.SIGNALS_CACHE.get(key, { type: "json" });
+    if (!stats) {
+      return { success: false, error: "Wallet not found" };
+    }
+    
+    // Get detailed trades
+    let trades = await env.SIGNALS_CACHE.get(tradesKey, { type: 'json' });
+    
+    // If no separate trades storage, use recentBets
+    if (!trades) {
+      trades = {
+        open: [],
+        resolved: [],
+        lastUpdated: null
+      };
+      
+      // Populate from recentBets - DEDUPLICATE by market+amount
+      const seen = new Map();
+      
+      if (stats.recentBets && stats.recentBets.length > 0) {
+        for (const bet of stats.recentBets) {
+          // Deduplicate
+          const dedupKey = `${(bet.market || bet.signalId || '').toLowerCase()}-${Math.round(bet.amount || 0)}`;
+          if (seen.has(dedupKey)) continue;
+          seen.set(dedupKey, true);
+          
+          const invested = bet.amount || 0;
+          const entryPrice = bet.price || 0.5;
+          
+          // CALCULATE P&L if bet has outcome but no pnl stored
+          let returned = bet.returned || 0;
+          let pnl = bet.pnl || 0;
+          let roi = bet.roi || 0;
+          
+          if (bet.outcome === 'WIN' && pnl === 0 && invested > 0) {
+            // WIN: shares = invested / price, return = shares * $1
+            const shares = invested / entryPrice;
+            returned = Math.round(shares * 100) / 100;
+            pnl = Math.round((returned - invested) * 100) / 100;
+            roi = Math.round((pnl / invested) * 100);
+          } else if (bet.outcome === 'LOSS' && pnl === 0 && invested > 0) {
+            // LOSS: lose everything
+            returned = 0;
+            pnl = -invested;
+            roi = -100;
+          }
+          
+          // Format market title - make it readable
+          let marketTitle = bet.marketTitle || bet.market || '';
+          marketTitle = formatMarketTitle(marketTitle);
+          
+          const tradeRecord = {
+            id: bet.id || `${bet.signalId || bet.market}-${bet.timestamp}`,
+            signalId: bet.signalId,
+            market: bet.market,
+            marketTitle: marketTitle,
+            direction: bet.direction,
+            amount: invested,
+            price: entryPrice,
+            timestamp: bet.timestamp,
+            outcome: bet.outcome,
+            settledAt: bet.settledAt,
+            invested: invested,
+            returned: returned,
+            pnl: pnl,
+            roi: roi,
+            currentPrice: bet.currentPrice || entryPrice,
+            currentValue: bet.currentValue || invested,
+            unrealizedPnl: bet.unrealizedPnl || 0
+          };
+          
+          // Separate based on outcome - if it has outcome, it's resolved
+          if (bet.outcome === 'WIN' || bet.outcome === 'LOSS') {
+            trades.resolved.push(tradeRecord);
+          } else {
+            trades.open.push(tradeRecord);
+          }
+        }
+      }
+    }
+    
+    // Calculate summary P&L stats
+    const totalInvested = [...trades.open, ...trades.resolved].reduce((sum, t) => sum + (t.invested || t.amount || 0), 0);
+    const totalReturned = trades.resolved.reduce((sum, t) => sum + (t.returned || 0), 0);
+    const realizedPnl = trades.resolved.reduce((sum, t) => sum + (t.pnl || 0), 0);
+    
+    // Calculate unrealized P&L for open positions (estimate based on current holdings)
+    let unrealizedPnl = 0;
+    for (const trade of trades.open) {
+      // If we had current market prices, we'd calculate here
+      // For now, estimate based on entry price
+      const currentValue = trade.currentValue || trade.amount || 0;
+      const invested = trade.invested || trade.amount || 0;
+      trade.unrealizedPnl = currentValue - invested;
+      unrealizedPnl += trade.unrealizedPnl;
+    }
+    
+    const totalPnl = realizedPnl + unrealizedPnl;
+    const roi = totalInvested > 0 ? Math.round((totalPnl / totalInvested) * 100) : 0;
+    
+    return {
+      success: true,
+      address: walletAddress.toLowerCase(),
+      
+      // Summary stats
+      summary: {
+        totalPnl: Math.round(totalPnl * 100) / 100,
+        realizedPnl: Math.round(realizedPnl * 100) / 100,
+        unrealizedPnl: Math.round(unrealizedPnl * 100) / 100,
+        totalInvested: Math.round(totalInvested * 100) / 100,
+        totalReturned: Math.round(totalReturned * 100) / 100,
+        roi,
+        wins: stats.wins || 0,
+        losses: stats.losses || 0,
+        pending: stats.pending || 0,
+        winRate: stats.winRate || 0,
+        totalVolume: stats.totalVolume || 0,
+        currentStreak: stats.currentStreak || 0,
+        bestStreak: stats.bestStreak || 0
+      },
+      
+      // Detailed trade arrays
+      openBets: trades.open.map(t => ({
+        id: t.id,
+        market: t.market,
+        marketTitle: t.marketTitle || t.market,
+        direction: t.direction,
+        invested: t.invested || t.amount || 0,
+        entryPrice: t.price || 0,
+        currentPrice: t.currentPrice || t.price || 0,
+        currentValue: t.currentValue || t.invested || 0,
+        unrealizedPnl: t.unrealizedPnl || 0,
+        roi: t.roi || 0,
+        timestamp: t.timestamp
+      })),
+      
+      resolvedBets: trades.resolved.map(t => ({
+        id: t.id,
+        market: t.market,
+        marketTitle: t.marketTitle || t.market,
+        direction: t.direction,
+        outcome: t.outcome,
+        invested: t.invested || t.amount || 0,
+        entryPrice: t.price || 0,
+        returned: t.returned || 0,
+        pnl: t.pnl || 0,
+        roi: t.roi || 0,
+        timestamp: t.timestamp,
+        settledAt: t.settledAt
+      })),
+      
+      lastUpdated: trades.lastUpdated || stats.lastBetAt
+    };
+    
+  } catch (e) {
+    console.error("Error getting wallet P&L:", e.message);
+    return { success: false, error: e.message };
+  }
 }
 
 // Update winning wallets cache (fast lookup for scans)

@@ -5,10 +5,10 @@
 
 import { corsHeaders, VERSION, SPORT_KEY_MAP, KV_KEYS } from './config.js';
 import { runScan, getRecentSignals, getSignal, getPendingSignalsCount, getTrackedWalletsCount } from './signals.js';
-import { getWalletStats, getWalletLeaderboard, getTrackedWallets, pruneLosingWallets, clearTradeBuckets, fullKVCleanup, deduplicateWalletBets } from './wallets.js';
+import { getWalletStats, getWalletLeaderboard, getTrackedWallets, pruneLosingWallets, clearTradeBuckets, fullKVCleanup, deduplicateWalletBets, getWalletPnL } from './wallets.js';
 import { getOddsComparison, getGameScores, getGameOdds } from './odds-api.js';
 import { processSettledSignals } from './settlement.js';
-import { getFactorStats, getAIRecommendation, updateFactorStats, getDiscoveredPatterns } from './learning.js';
+import { getFactorStats, getAIRecommendation, updateFactorStats, getDiscoveredPatterns, getFactorCombos, hasStrongCombo } from './learning.js';
 import { pollAndStoreTrades, getAccumulatedTrades, getPollStats, clearAccumulatedTrades } from './trades.js';
 
 // Polymarket API functions
@@ -360,23 +360,8 @@ export default {
       
       if (path.startsWith("/wallet/") && path.endsWith("/pnl")) {
         const address = path.split("/")[2];
-        const stats = await getWalletStats(env, address);
-        
-        if (!stats) {
-          return jsonResponse({ success: false, error: "Wallet not found" });
-        }
-        
-        return jsonResponse({ 
-          success: true,
-          address: stats.address,
-          totalPnl: stats.profitLoss || 0,
-          roi: stats.edgeMetrics?.roi || 0,
-          totalVolume: stats.totalVolume || 0,
-          wins: stats.wins || 0,
-          losses: stats.losses || 0,
-          winRate: stats.winRate || 0,
-          recentBets: stats.recentBets || []
-        });
+        const pnlData = await getWalletPnL(env, address);
+        return jsonResponse(pnlData);
       }
       
       // ============ ODDS ENDPOINTS ============
@@ -385,6 +370,80 @@ export default {
         const sport = url.searchParams.get("sport") || "nba";
         const result = await getOddsComparison(env, sport);
         return jsonResponse(result);
+      }
+      
+      // Debug endpoint to test Polymarket market fetching
+      if (path === "/debug/poly-markets") {
+        const sport = url.searchParams.get("sport") || "nba";
+        try {
+          const polyMarkets = await getSportsMarketsWithPrices(env, sport);
+          return jsonResponse({
+            success: true,
+            sport,
+            marketsFound: polyMarkets?.markets?.length || 0,
+            fromCache: polyMarkets?.fromCache || false,
+            source: polyMarkets?.source || 'unknown',
+            seriesId: polyMarkets?.seriesId || null,
+            eventsCount: polyMarkets?.eventsCount || 0,
+            sampleMarkets: (polyMarkets?.markets || []).slice(0, 5).map(m => ({
+              slug: m.slug,
+              eventSlug: m.eventSlug,
+              eventTitle: m.eventTitle,
+              question: m.question,
+              outcomes: m.outcomes,
+              outcomePrices: m.outcomePrices,
+              yesPrice: m.yesPrice,
+              noPrice: m.noPrice,
+              gameStartTime: m.gameStartTime
+            })),
+            error: polyMarkets?.error || null
+          });
+        } catch (e) {
+          return jsonResponse({ success: false, error: e.message, stack: e.stack });
+        }
+      }
+      
+      // Debug: show raw /sports metadata from Gamma API
+      if (path === "/debug/sports-meta") {
+        try {
+          const response = await fetch(`https://gamma-api.polymarket.com/sports`);
+          const data = await response.json();
+          return jsonResponse({ success: true, status: response.status, data });
+        } catch (e) {
+          return jsonResponse({ success: false, error: e.message });
+        }
+      }
+      
+      // Debug: test raw events fetch for a series_id
+      if (path === "/debug/events-raw") {
+        const seriesId = url.searchParams.get("series_id") || "10345";
+        try {
+          const response = await fetch(
+            `https://gamma-api.polymarket.com/events?series_id=${seriesId}&active=true&closed=false&limit=10&order=startTime&ascending=true`
+          );
+          const data = await response.json();
+          return jsonResponse({
+            success: true,
+            seriesId,
+            status: response.status,
+            eventsReturned: Array.isArray(data) ? data.length : 'not array',
+            sampleEvents: (Array.isArray(data) ? data : []).slice(0, 3).map(e => ({
+              id: e.id,
+              slug: e.slug,
+              title: e.title,
+              startDate: e.startDate,
+              marketsCount: e.markets?.length || 0,
+              sampleMarket: e.markets?.[0] ? {
+                question: e.markets[0].question,
+                slug: e.markets[0].slug,
+                outcomes: e.markets[0].outcomes,
+                outcomePrices: e.markets[0].outcomePrices
+              } : null
+            }))
+          });
+        } catch (e) {
+          return jsonResponse({ success: false, error: e.message });
+        }
       }
       
       if (path === "/odds/compare") {
@@ -460,7 +519,80 @@ export default {
             factorCount: Object.keys(stats).length
           },
           marketTypeStats,
-          volumeBrackets
+          volumeBrackets,
+          // Factor descriptions for frontend display
+          factorDescriptions: {
+            // Whale size
+            whaleSize100k: 'Largest single bet > $100K',
+            whaleSize50k: 'Largest single bet $50K-$100K',
+            whaleSize25k: 'Largest single bet $25K-$50K',
+            whaleSize15k: 'Largest single bet $15K-$25K',
+            whaleSize8k: 'Largest single bet $8K-$15K',
+            whaleSize5k: 'Largest single bet $5K-$8K',
+            whaleSize3k: 'Largest single bet $3K-$5K',
+            // Volume
+            volumeHuge: 'Total market volume > $500K',
+            volumeModerate: 'Total market volume $50K-$100K',
+            volumeNotable: 'Total market volume $100K-$500K',
+            vol_100k_plus: 'Signal volume over $100K',
+            vol_50k_100k: 'Signal volume $50K-$100K',
+            vol_25k_50k: 'Signal volume $25K-$50K',
+            vol_10k_25k: 'Signal volume $10K-$25K',
+            vol_under_10k: 'Signal volume under $10K',
+            // Concentration
+            concentrated: 'Betting heavily concentrated (>70% one direction)',
+            coordinated: 'Multiple wallets betting same direction within minutes',
+            // Directional odds (IMPROVEMENT #4)
+            buyDeepLongshot: 'Buying at <15% (deep longshot)',
+            buyLongshot: 'Buying at 15-25% (longshot)',
+            buyUnderdog: 'Buying at 25-40% (underdog)',
+            buyFavorite: 'Buying at 70-85% (favorite)',
+            buyHeavyFavorite: 'Buying at 85%+ (heavy favorite)',
+            // Legacy odds
+            extremeOdds: 'Entry price < 20% or > 80% (legacy)',
+            moderateLongshot: 'Betting on longshot (20-40% odds)',
+            moderateFavorite: 'Betting on favorite (60-80% odds)',
+            // Event timing (IMPROVEMENT #5)
+            betDuringEvent: 'Bet placed during/after event start (live)',
+            betLast2Hours: 'Bet placed within 2 hours of event',
+            betSameDay: 'Bet placed same day (2-6h before)',
+            betDayBefore: 'Bet placed day before event',
+            betEarlyDays: 'Bet placed 1-3 days before event',
+            betVeryEarly: 'Bet placed 3+ days before event',
+            // Wallets
+            winningWallet: 'Signal includes wallet with 55%+ win rate',
+            freshWhale5k: 'New wallet betting $5K+ (< 5 prior bets)',
+            freshWhale10k: 'New wallet betting $10K+ (< 5 prior bets)',
+            // Market types
+            'sports-nba': 'NBA basketball game',
+            'sports-nfl': 'NFL football game',
+            'sports-nhl': 'NHL hockey game',
+            'sports-ncaab': 'NCAA basketball game',
+            'sports-mma': 'MMA/UFC fight',
+            'sports-other': 'Other sports market',
+            'sports-futures': 'Futures/Championship market',
+            crypto: 'Cryptocurrency market',
+            politics: 'Political market',
+            other: 'Other market type',
+            // Wallet count
+            single_wallet: 'Single wallet signal',
+            two_wallets: 'Two wallets in signal',
+            few_wallets_3_5: '3-5 wallets in signal',
+            many_wallets_6_plus: '6+ wallets in signal',
+            // Time of day
+            morning_5_12: 'Signal detected 5am-12pm ET',
+            afternoon_12_17: 'Signal detected 12pm-5pm ET',
+            evening_17_22: 'Signal detected 5pm-10pm ET',
+            night_22_5: 'Signal detected 10pm-5am ET',
+            // Days
+            day_monday: 'Signal detected on Monday',
+            day_tuesday: 'Signal detected on Tuesday',
+            day_wednesday: 'Signal detected on Wednesday',
+            day_thursday: 'Signal detected on Thursday',
+            day_friday: 'Signal detected on Friday',
+            day_saturday: 'Signal detected on Saturday',
+            day_sunday: 'Signal detected on Sunday',
+          }
         });
       }
       
@@ -486,6 +618,91 @@ export default {
           message: fadeFactors.length > 0 
             ? `Found ${fadeFactors.length} factors to fade` 
             : 'No fade candidates yet'
+        });
+      }
+      
+      // ============================================================
+      // NEW: Factor Combo Tracking Endpoint
+      // ============================================================
+      if (path === "/learning/combos") {
+        const combos = await getFactorCombos(env);
+        return jsonResponse({ 
+          success: true, 
+          ...combos,
+          message: combos.bestCombos.length > 0 
+            ? `Found ${combos.bestCombos.length} strong combos, ${combos.worstCombos.length} weak combos`
+            : 'Need more settled signals to identify combos'
+        });
+      }
+      
+      // ============================================================
+      // NEW: Alert Check Endpoint (for Twilio integration)
+      // ============================================================
+      if (path === "/alerts/check") {
+        const alerts = [];
+        
+        // Get recent signals
+        const recentSignals = await getRecentSignals(env, 50);
+        const factorStats = await getFactorStats(env);
+        
+        for (const signal of recentSignals) {
+          const alertReasons = [];
+          let priority = 'LOW';
+          
+          // Check 1: Elite wallet betting
+          if (signal.hasWinningWallet && signal.largestBet >= 25000) {
+            alertReasons.push(`🏆 Elite wallet bet $${signal.largestBet.toLocaleString()}`);
+            priority = 'HIGH';
+          }
+          
+          // Check 2: High-performing factor combo
+          const factors = signal.scoreBreakdown?.map(f => f.factor) || [];
+          const hasVolumeHuge = factors.includes('volumeHuge');
+          const hasFreshWhale = factors.includes('freshWhale5k');
+          
+          if (hasVolumeHuge && hasFreshWhale) {
+            alertReasons.push('🔥 High-prob combo: volumeHuge + freshWhale5k');
+            priority = 'CRITICAL';
+          } else if (hasVolumeHuge) {
+            alertReasons.push('📈 volumeHuge factor (88% historical WR)');
+            if (priority === 'LOW') priority = 'MEDIUM';
+          }
+          
+          // Check 3: AI score is very high
+          if (signal.aiScore && signal.aiScore >= 80) {
+            alertReasons.push(`🤖 High AI Score: ${signal.aiScore}`);
+            if (priority === 'LOW') priority = 'MEDIUM';
+          }
+          
+          // Only create alert if we have reasons
+          if (alertReasons.length > 0) {
+            alerts.push({
+              id: signal.id,
+              type: priority === 'CRITICAL' ? 'HIGH_PROBABILITY_COMBO' : 
+                    priority === 'HIGH' ? 'ELITE_WALLET_BET' : 'NOTABLE_SIGNAL',
+              priority,
+              market: signal.marketTitle,
+              direction: signal.direction,
+              price: signal.displayPrice,
+              amount: signal.largestBet,
+              reasons: alertReasons,
+              aiScore: signal.aiScore,
+              confidence: signal.confidence,
+              timestamp: signal.firstTradeTime
+            });
+          }
+        }
+        
+        // Sort by priority
+        const priorityOrder = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+        alerts.sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]);
+        
+        return jsonResponse({
+          success: true,
+          alerts: alerts.slice(0, 20),  // Top 20 alerts
+          totalAlerts: alerts.length,
+          criticalCount: alerts.filter(a => a.priority === 'CRITICAL').length,
+          highCount: alerts.filter(a => a.priority === 'HIGH').length
         });
       }
       

@@ -149,28 +149,19 @@ export async function getMarketBySlug(env, slug) {
 
 /**
  * Get all sports markets for a specific sport
- * Sports use tag_slugs like: 'nba', 'nfl', 'ncaa-cbb', 'nhl', etc.
+ * Uses /sports endpoint for series_id, then /events?series_id=&tag_id=100639 for game events
+ * Each event = one game, containing multiple markets (moneyline, spread, props)
+ * We extract only the moneyline market (slug matches event slug with no suffix)
  */
 export async function getSportsMarkets(env, sport) {
-  // Map our sport codes to Polymarket tag slugs
-  const sportTagMap = {
-    'nba': 'nba',
-    'nfl': 'nfl',
-    'ncaab': 'ncaa-cbb',
-    'cbb': 'ncaa-cbb',
-    'ncaaf': 'college-football',
-    'cfb': 'college-football',
-    'nhl': 'nhl',
-    'mlb': 'mlb',
-    'ufc': 'ufc',
-    'mma': 'mma',
-    'epl': 'epl',
-    'soccer': 'soccer'
-  };
-
-  const tagSlug = sportTagMap[sport.toLowerCase()] || sport.toLowerCase();
+  const seriesIds = await getSportSeriesIds(env, sport);
   
-  const cacheKey = `sports_markets_${tagSlug}`;
+  if (seriesIds.length === 0) {
+    console.log(`No series_ids found for sport: ${sport}`);
+    return { success: false, error: `No series_ids for ${sport}`, markets: [] };
+  }
+  
+  const cacheKey = `sports_events_v3_${sport}_${seriesIds.join('_')}`;
   
   if (env.SIGNALS_CACHE) {
     try {
@@ -182,26 +173,81 @@ export async function getSportsMarkets(env, sport) {
   }
 
   try {
-    // Fetch active markets for this sport
-    const response = await fetch(
-      `${GAMMA_API}/markets?tag_slug=${tagSlug}&active=true&closed=false&limit=200`
-    );
+    // Query ALL series IDs and combine results
+    const allGameMarkets = [];
+    let totalEvents = 0;
     
-    if (!response.ok) throw new Error(`Gamma API error: ${response.status}`);
-    
-    const markets = await response.json();
-    
-    // Filter to only game markets (not futures)
-    const gameMarkets = markets
-      .map(m => parseMarket(m))
-      .filter(m => isGameMarket(m));
+    for (const seriesId of seriesIds) {
+      try {
+        const response = await fetch(
+          `${GAMMA_API}/events?series_id=${seriesId}&tag_id=100639&active=true&closed=false&limit=200&order=startTime&ascending=true`
+        );
+        
+        if (!response.ok) {
+          console.log(`Gamma events API error for series ${seriesId}: ${response.status}`);
+          continue;
+        }
+        
+        const events = await response.json();
+        console.log(`Series ${seriesId}: ${events.length} game events for ${sport}`);
+        totalEvents += events.length;
+        
+        for (const event of events) {
+          if (!event.markets || event.markets.length === 0) continue;
+          
+          const eventSlug = event.slug;
+          let moneylineMarket = null;
+          
+          // Strategy 1: exact slug match
+          moneylineMarket = event.markets.find(m => m.slug === eventSlug);
+          
+          // Strategy 2: slug with no suffix after date
+          if (!moneylineMarket) {
+            moneylineMarket = event.markets.find(m => {
+              const slug = m.slug || '';
+              return /^[a-z]+-[a-z]+-[a-z]+-\d{4}-\d{2}-\d{2}$/.test(slug);
+            });
+          }
+          
+          // Strategy 3: outcomes are team names (not Yes/No/Over/Under)
+          if (!moneylineMarket) {
+            moneylineMarket = event.markets.find(m => {
+              const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : (m.outcomes || []);
+              if (outcomes.length !== 2) return false;
+              const o0 = outcomes[0].toLowerCase();
+              const o1 = outcomes[1].toLowerCase();
+              return o0 !== 'yes' && o0 !== 'no' && o0 !== 'over' && o0 !== 'under' 
+                && !m.slug?.includes('-spread') && !m.slug?.includes('-total') 
+                && !m.slug?.includes('-assists') && !m.slug?.includes('-points')
+                && !m.slug?.includes('-rebounds') && !m.slug?.includes('-1h-');
+            });
+          }
+          
+          if (moneylineMarket) {
+            const parsed = parseMarket(moneylineMarket);
+            parsed.eventSlug = event.slug;
+            parsed.eventTitle = event.title;
+            parsed.eventId = event.id;
+            parsed.gameStartTime = event.startDate;
+            parsed.totalMarketsInEvent = event.markets.length;
+            allGameMarkets.push(parsed);
+          }
+        }
+      } catch (seriesErr) {
+        console.error(`Error fetching series ${seriesId}:`, seriesErr.message);
+      }
+    }
+
+    console.log(`Total: ${allGameMarkets.length} moneyline markets from ${totalEvents} events across ${seriesIds.length} series`);
 
     const result = {
       success: true,
       sport,
-      tagSlug,
-      count: gameMarkets.length,
-      markets: gameMarkets,
+      seriesIds,
+      source: 'events-api-v3',
+      count: allGameMarkets.length,
+      eventsCount: totalEvents,
+      markets: allGameMarkets,
       timestamp: new Date().toISOString()
     };
 
@@ -214,9 +260,89 @@ export async function getSportsMarkets(env, sport) {
 
     return result;
   } catch (e) {
-    return { success: false, error: e.message };
+    console.error(`getSportsMarkets error for ${sport}:`, e.message);
+    return { success: false, error: e.message, markets: [] };
   }
 }
+
+/**
+ * Get ALL series IDs for a sport from /sports endpoint
+ * Returns array since some sports have multiple series (e.g. ncaab has March Madness + regular CBB)
+ * Caches the mapping for 1 hour since it rarely changes
+ */
+async function getSportSeriesIds(env, sport) {
+  const cacheKey = 'polymarket_sports_metadata';
+  let sportsData = null;
+  
+  if (env.SIGNALS_CACHE) {
+    try {
+      const cached = await env.SIGNALS_CACHE.get(cacheKey, { type: 'json' });
+      if (cached && (Date.now() - cached.timestamp) < 3600 * 1000) {
+        sportsData = cached.data;
+      }
+    } catch (e) {}
+  }
+  
+  if (!sportsData) {
+    try {
+      const response = await fetch(`${GAMMA_API}/sports`);
+      if (!response.ok) throw new Error(`Sports API error: ${response.status}`);
+      sportsData = await response.json();
+      
+      if (env.SIGNALS_CACHE) {
+        await env.SIGNALS_CACHE.put(cacheKey, JSON.stringify({
+          data: sportsData,
+          timestamp: Date.now()
+        }), { expirationTtl: 3600 + 60 });
+      }
+    } catch (e) {
+      console.error('Failed to fetch /sports:', e.message);
+      return [];
+    }
+  }
+  
+  // Map our sport codes to ALL Polymarket sport codes to query
+  // Based on actual /sports API response Feb 2026:
+  //   ncaab=39(March Madness), cbb=10470(regular CBB), cwbb=10471(womens)
+  //   nba=10345, nhl=10346, nfl=10187, mlb=3, cfb=10210, mma=10500
+  const SPORT_SEARCH_KEYS = {
+    'nba':   ['nba'],
+    'nfl':   ['nfl'],
+    'ncaab': ['ncaab', 'cbb'],     // Both March Madness AND regular season CBB
+    'cbb':   ['cbb', 'ncaab'],
+    'ncaaf': ['cfb'],
+    'cfb':   ['cfb'],
+    'nhl':   ['nhl'],
+    'mlb':   ['mlb'],
+    'ufc':   ['mma'],
+    'mma':   ['mma'],
+  };
+  
+  const searchKeys = SPORT_SEARCH_KEYS[sport.toLowerCase()] || [sport.toLowerCase()];
+  const sportsList = Array.isArray(sportsData) ? sportsData : Object.values(sportsData);
+  
+  const seriesIds = [];
+  const seen = new Set();
+  
+  for (const key of searchKeys) {
+    for (const entry of sportsList) {
+      const entrySport = (entry.sport || '').toLowerCase();
+      const seriesId = entry.series;
+      if (entrySport === key && seriesId && !seen.has(seriesId)) {
+        seriesIds.push(seriesId);
+        seen.add(seriesId);
+        console.log(`Found series ${seriesId} for sport ${sport} (matched: ${entrySport})`);
+      }
+    }
+  }
+  
+  if (seriesIds.length === 0) {
+    console.log(`No series match for sport: ${sport}. Available: ${sportsList.map(s => s.sport).join(', ')}`);
+  }
+  
+  return seriesIds;
+}
+
 
 // ============================================================
 // CLOB API - Real-Time Prices & Orderbook
@@ -411,11 +537,13 @@ export async function getSportsMarketsWithPrices(env, sport) {
     
     return {
       slug: market.slug,
+      eventSlug: market.eventSlug,
+      eventTitle: market.eventTitle,
       question: market.question,
       outcomes: market.outcomes,
       outcomePrices: prices, // Real-time prices from Gamma!
-      yesPrice: prices[0] ? Math.round(prices[0] * 100) : null,
-      noPrice: prices[1] ? Math.round(prices[1] * 100) : null,
+      yesPrice: prices[0] !== undefined && prices[0] !== null ? Math.round(prices[0] * 100) : null,
+      noPrice: prices[1] !== undefined && prices[1] !== null ? Math.round(prices[1] * 100) : null,
       volume: market.volume,
       liquidity: market.liquidity,
       endDate: market.endDate,

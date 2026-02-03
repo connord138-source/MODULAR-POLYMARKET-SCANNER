@@ -6,7 +6,7 @@ import { POLYMARKET_API, KV_KEYS, SPORT_KEY_MAP } from './config.js';
 import { detectSportFromSlug, extractTeamsFromSlug, getTeamFullName } from './utils.js';
 import { getGameScores, findMatchingGame } from './odds-api.js';
 import { recordWalletOutcome } from './wallets.js';
-import { updateFactorStats, trackSignalMetadata } from './learning.js';
+import { updateFactorStats, trackSignalMetadata, trackFactorCombo } from './learning.js';
 
 // Check market settlement via Polymarket trades
 export async function checkMarketSettlement(marketSlug, signalDetectedAt) {
@@ -243,6 +243,9 @@ export async function processSettledSignals(env) {
             const factors = signalData.scoreBreakdown || signalData.factors || [];
             if (factors.length > 0) {
               await updateFactorStats(env, factors, outcome);
+              
+              // NEW: Track factor combinations
+              await trackFactorCombo(env, factors, outcome);
             }
             
             // Track signal metadata for pattern discovery
@@ -311,6 +314,9 @@ export async function processSettledSignals(env) {
         const polyFactors = signalData.scoreBreakdown || signalData.factors || [];
         if (polyFactors.length > 0) {
           await updateFactorStats(env, polyFactors, outcome);
+          
+          // NEW: Track factor combinations
+          await trackFactorCombo(env, polyFactors, outcome);
         }
         
         // Track signal metadata for pattern discovery

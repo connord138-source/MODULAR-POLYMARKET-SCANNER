@@ -39,13 +39,14 @@ async function getCachedOrFetch(env, cacheKey, fetchFn, ttlSeconds) {
   
   try {
     const cached = await env.SIGNALS_CACHE.get(cacheKey, { type: "json" });
-    if (cached && cached.data) {
+    if (cached && cached.data !== undefined && cached.data !== null) {
       const age = Date.now() - cached.timestamp;
       const maxAge = ttlSeconds * 1000;
       
       if (age < maxAge) {
         console.log(`Cache HIT for ${cacheKey} (age: ${Math.round(age/1000)}s)`);
-        return { ...cached.data, fromCache: true, cacheAge: Math.round(age/1000) };
+        // Return data directly - don't spread arrays into objects
+        return cached.data;
       }
     }
     
@@ -148,7 +149,26 @@ export async function getOddsComparison(env, sport) {
     console.log(`Building odds comparison for ${sport}...`);
     
     // 1. Fetch Vegas odds
-    const vegasOdds = await getGameOdds(env, sportKey, 'h2h,spreads');
+    const vegasOddsRaw = await getGameOdds(env, sportKey, 'h2h,spreads');
+    
+    // getGameOdds returns through getCachedOrFetch which may wrap the array
+    // Handle: raw array, object with numeric keys (spread array), or null
+    let vegasOdds = [];
+    if (Array.isArray(vegasOddsRaw)) {
+      vegasOdds = vegasOddsRaw;
+    } else if (vegasOddsRaw && typeof vegasOddsRaw === 'object') {
+      // getCachedOrFetch spreads arrays into objects: { 0: game1, 1: game2, fromCache: true }
+      // Extract the game entries back out
+      const entries = Object.entries(vegasOddsRaw)
+        .filter(([key]) => /^\d+$/.test(key))
+        .sort(([a], [b]) => parseInt(a) - parseInt(b))
+        .map(([_, val]) => val);
+      if (entries.length > 0) {
+        vegasOdds = entries;
+      }
+    }
+    
+    console.log(`Vegas odds extracted: ${vegasOdds.length} games (raw type: ${Array.isArray(vegasOddsRaw) ? 'array' : typeof vegasOddsRaw})`);
     
     // 2. Fetch Polymarket markets with REAL-TIME prices from Gamma API
     const polyMarkets = await getSportsMarketsWithPrices(env, sport);
@@ -158,9 +178,21 @@ export async function getOddsComparison(env, sport) {
     // 3. Build Polymarket lookup by slug patterns
     const polyLookup = buildPolymarketLookup(polyMarkets?.markets || []);
     
+    // Debug: log sample lookup keys
+    const slugKeys = Object.keys(polyLookup.bySlug).slice(0, 5);
+    const teamDateKeys = Object.keys(polyLookup.byTeamDate).slice(0, 10);
+    console.log(`Poly lookup sample slugs: ${JSON.stringify(slugKeys)}`);
+    console.log(`Poly lookup sample team-dates: ${JSON.stringify(teamDateKeys)}`);
+    
     // 4. Match and compare each Vegas game
     const games = (vegasOdds || []).map(vegasGame => {
-      return processGameWithRealTimePrices(vegasGame, polyLookup);
+      const result = processGameWithRealTimePrices(vegasGame, polyLookup);
+      if (!result.hasPolymarket) {
+        console.log(`NO MATCH: ${vegasGame.away_team} @ ${vegasGame.home_team} (${vegasGame.commence_time?.split('T')[0]})`);
+      } else {
+        console.log(`MATCHED: ${vegasGame.away_team} @ ${vegasGame.home_team} → ${result.polymarket?.slug}`);
+      }
+      return result;
     });
     
     // 5. Sort by edge (reliable data first)
@@ -232,49 +264,63 @@ function buildPolymarketLookup(markets) {
   for (const market of markets) {
     if (!market.slug) continue;
     
+    const slug = market.slug.toLowerCase();
+    
     // Store by full slug
-    lookup.bySlug[market.slug.toLowerCase()] = market;
+    lookup.bySlug[slug] = market;
     
-    // Parse slug to create team-date key
-    // Format: cbb-duke-vtech-2026-01-31
-    const slugParts = market.slug.toLowerCase().split('-');
-    const dateMatch = market.slug.match(/(\d{4}-\d{2}-\d{2})/);
+    // Extract date from slug: nba-mem-lal-2026-02-03
+    const dateMatch = slug.match(/(\d{4}-\d{2}-\d{2})/);
+    if (!dateMatch) continue;
+    const date = dateMatch[1];
     
-    if (dateMatch) {
-      const date = dateMatch[1];
-      // Remove sport prefix and date, keep team parts
-      const sportPrefix = slugParts[0];
-      const dateIdx = slugParts.findIndex(p => /^\d{4}$/.test(p));
+    // Extract team abbreviations from slug
+    // Format: {sport}-{away}-{home}-{date} e.g. nba-mem-lal-2026-01-04
+    const parts = slug.split('-');
+    const dateIdx = parts.findIndex(p => /^\d{4}$/.test(p));
+    if (dateIdx > 2) {
+      const teamParts = parts.slice(1, dateIdx); // e.g. ['mem', 'lal']
       
-      if (dateIdx > 1) {
-        const teamParts = slugParts.slice(1, dateIdx);
-        const teamKey = teamParts.join('-');
-        
-        // Store by team-date combo
-        const key = `${teamKey}-${date}`;
-        lookup.byTeamDate[key] = market;
-        
-        // Also store individual team names for fuzzy matching
-        for (const team of teamParts) {
-          if (team.length > 2) {
-            const teamDateKey = `${team}-${date}`;
-            if (!lookup.byTeamDate[teamDateKey]) {
-              lookup.byTeamDate[teamDateKey] = market;
-            }
+      // Store by each team abbreviation + date
+      for (const abbr of teamParts) {
+        const key = `${abbr}-${date}`;
+        if (!lookup.byTeamDate[key]) {
+          lookup.byTeamDate[key] = market;
+        }
+      }
+      
+      // Store by combined abbreviation + date
+      const combinedKey = `${teamParts.join('-')}-${date}`;
+      lookup.byTeamDate[combinedKey] = market;
+    }
+    
+    // ALSO index by full outcome team names (most reliable for matching)
+    // e.g. outcomes: ["Lakers", "Grizzlies"]
+    const outcomes = market.outcomes || [];
+    for (const outcome of outcomes) {
+      // Full outcome name lowercase, alphanumeric only
+      const cleanOutcome = outcome.toLowerCase().replace(/[^a-z0-9]/g, '');
+      lookup.byTeamDate[`${cleanOutcome}-${date}`] = market;
+      
+      // Also store individual words from outcome (for "Trail Blazers" -> "blazers")
+      const words = outcome.toLowerCase().split(/\s+/);
+      for (const word of words) {
+        if (word.length > 3) {
+          const wordKey = `${word}-${date}`;
+          if (!lookup.byTeamDate[wordKey]) {
+            lookup.byTeamDate[wordKey] = market;
           }
         }
       }
     }
     
-    // Also try to extract from outcomes (team names)
-    if (market.outcomes && market.outcomes.length >= 2) {
-      const dateMatch = market.slug.match(/(\d{4}-\d{2}-\d{2})/);
-      if (dateMatch) {
-        for (const outcome of market.outcomes) {
-          const teamName = outcome.toLowerCase().replace(/[^a-z0-9]/g, '');
-          const key = `${teamName}-${dateMatch[1]}`;
-          lookup.byTeamDate[key] = market;
-        }
+    // Index by event title words too (e.g. "Grizzlies vs. Lakers")
+    const title = (market.eventTitle || market.question || '').toLowerCase();
+    const titleWords = title.split(/[\s.]+/).filter(w => w.length > 3 && w !== 'vs');
+    for (const word of titleWords) {
+      const wordKey = `${word}-${date}`;
+      if (!lookup.byTeamDate[wordKey]) {
+        lookup.byTeamDate[wordKey] = market;
       }
     }
   }
@@ -324,30 +370,49 @@ function processGameWithRealTimePrices(vegasGame, polyLookup) {
   let polyAwayPrice = null;
   
   if (polyMatch) {
-    // Use real-time prices from Gamma API
-    polyHomePrice = polyMatch.yesPrice;
-    polyAwayPrice = polyMatch.noPrice;
-    
-    // Determine which outcome is home team
-    // Polymarket outcomes array: typically [Team1, Team2] matching Yes/No prices
+    // Determine which Polymarket outcome corresponds to which Vegas team
+    // outcomes[0] has price outcomePrices[0] (yesPrice), outcomes[1] has outcomePrices[1] (noPrice)
     if (polyMatch.outcomes && polyMatch.outcomes.length >= 2) {
       const homeTeamLower = vegasGame.home_team.toLowerCase();
       const awayTeamLower = vegasGame.away_team.toLowerCase();
       
-      // Check if outcomes[0] matches home or away
       const outcome0Lower = polyMatch.outcomes[0].toLowerCase();
       const outcome1Lower = polyMatch.outcomes[1].toLowerCase();
       
-      const outcome0IsHome = isTeamMatch(outcome0Lower, homeTeamLower);
-      const outcome0IsAway = isTeamMatch(outcome0Lower, awayTeamLower);
+      // Use a scoring approach: score how well each outcome matches each team
+      // Higher score = better match. This handles same-mascot teams (Rams vs Rams)
+      const score_o0_home = teamMatchScore(outcome0Lower, homeTeamLower);
+      const score_o0_away = teamMatchScore(outcome0Lower, awayTeamLower);
+      const score_o1_home = teamMatchScore(outcome1Lower, homeTeamLower);
+      const score_o1_away = teamMatchScore(outcome1Lower, awayTeamLower);
       
-      if (outcome0IsHome) {
+      console.log(`Price assignment: o0="${polyMatch.outcomes[0]}" o1="${polyMatch.outcomes[1]}" | home="${vegasGame.home_team}" away="${vegasGame.away_team}" | scores: o0h=${score_o0_home} o0a=${score_o0_away} o1h=${score_o1_home} o1a=${score_o1_away} | yesPrice=${polyMatch.yesPrice} noPrice=${polyMatch.noPrice}`);
+      
+      // Pick the assignment that maximizes total match score
+      const assignNormal = score_o0_home + score_o1_away; // o0=home, o1=away
+      const assignFlipped = score_o0_away + score_o1_home; // o0=away, o1=home
+      
+      if (assignNormal >= assignFlipped && assignNormal > 0) {
+        // outcomes[0] = home team, outcomes[1] = away team
         polyHomePrice = polyMatch.yesPrice;
         polyAwayPrice = polyMatch.noPrice;
-      } else if (outcome0IsAway) {
+        console.log(`→ Assignment: NORMAL (o0=home=${polyMatch.yesPrice}¢, o1=away=${polyMatch.noPrice}¢)`);
+      } else if (assignFlipped > assignNormal && assignFlipped > 0) {
+        // outcomes[0] = away team, outcomes[1] = home team
+        polyAwayPrice = polyMatch.yesPrice;
+        polyHomePrice = polyMatch.noPrice;
+        console.log(`→ Assignment: FLIPPED (o0=away=${polyMatch.yesPrice}¢, o1=home=${polyMatch.noPrice}¢)`);
+      } else {
+        // Can't determine - log warning but try based on slug order
+        console.log(`WARNING: Cannot determine team assignment for ${vegasGame.home_team} vs ${vegasGame.away_team}, outcomes: ${polyMatch.outcomes.join(', ')}`);
+        // Poly slug format is typically away-home, so outcomes[0]=away, outcomes[1]=home
         polyAwayPrice = polyMatch.yesPrice;
         polyHomePrice = polyMatch.noPrice;
       }
+    } else {
+      // No outcomes to match - use raw prices
+      polyHomePrice = polyMatch.yesPrice;
+      polyAwayPrice = polyMatch.noPrice;
     }
     
     // Calculate edge
@@ -409,11 +474,18 @@ function processGameWithRealTimePrices(vegasGame, polyLookup) {
     polymarket: polyMatch ? {
       slug: polyMatch.slug,
       outcomes: polyMatch.outcomes,
+      // Direct access (backwards compat)
       home: { price: polyHomePrice },
       away: { price: polyAwayPrice },
+      // Nested under moneyline (what GameCard.jsx expects)
+      moneyline: {
+        home: { price: polyHomePrice },
+        away: { price: polyAwayPrice }
+      },
       volume: polyMatch.volume,
       liquidity: polyMatch.liquidity,
-      source: 'gamma-api-realtime'
+      source: 'gamma-api-realtime',
+      lastUpdate: new Date().toISOString()
     } : null,
     edge: { 
       home: homeEdge !== null ? Math.round(homeEdge) : null, 
@@ -429,68 +501,195 @@ function processGameWithRealTimePrices(vegasGame, polyLookup) {
  * Find matching Polymarket market for a Vegas game
  */
 function findPolymarketMatch(vegasGame, polyLookup) {
-  const homeTeam = vegasGame.home_team.toLowerCase();
-  const awayTeam = vegasGame.away_team.toLowerCase();
-  const gameDate = vegasGame.commence_time?.split('T')[0];
+  const homeTeam = vegasGame.home_team; // e.g. "Indiana Pacers"
+  const awayTeam = vegasGame.away_team; // e.g. "Houston Rockets" 
+  const gameDate = vegasGame.commence_time?.split('T')[0]; // e.g. "2026-02-03"
   
-  // Also check previous day (UTC vs ET timezone issues)
-  let prevDate = null;
-  if (gameDate) {
-    const d = new Date(gameDate);
-    d.setDate(d.getDate() - 1);
-    prevDate = d.toISOString().split('T')[0];
-  }
+  if (!gameDate) return null;
   
-  // Try various matching strategies
-  const searchDates = [gameDate, prevDate].filter(Boolean);
+  // Check ±1 day for timezone offset (UTC vs ET)
+  const d = new Date(gameDate);
+  const prevDay = new Date(d); prevDay.setDate(d.getDate() - 1);
+  const nextDay = new Date(d); nextDay.setDate(d.getDate() + 1);
+  const searchDates = [
+    gameDate,
+    nextDay.toISOString().split('T')[0],
+    prevDay.toISOString().split('T')[0]
+  ];
+  
+  // Extract useful matching tokens from team names
+  const homeWords = homeTeam.toLowerCase().split(/\s+/);
+  const awayWords = awayTeam.toLowerCase().split(/\s+/);
+  const homeLast = homeWords[homeWords.length - 1]; // "pacers"
+  const awayLast = awayWords[awayWords.length - 1]; // "rockets"
+  
+  // NBA team abbreviation map (Vegas full name -> Poly abbreviation)
+  const NBA_ABBREV = {
+    'hawks': 'atl', 'celtics': 'bos', 'nets': 'bkn', 'hornets': 'cha',
+    'bulls': 'chi', 'cavaliers': 'cle', 'mavericks': 'dal', 'nuggets': 'den',
+    'pistons': 'det', 'warriors': 'gsw', 'rockets': 'hou', 'pacers': 'ind',
+    'clippers': 'lac', 'lakers': 'lal', 'grizzlies': 'mem', 'heat': 'mia',
+    'bucks': 'mil', 'timberwolves': 'min', 'pelicans': 'nop', 'knicks': 'nyk',
+    'thunder': 'okc', 'magic': 'orl', '76ers': 'phi', 'suns': 'phx',
+    'trail blazers': 'por', 'kings': 'sac', 'spurs': 'sas', 'raptors': 'tor',
+    'jazz': 'uta', 'wizards': 'was',
+  };
+  
+  // Get abbreviations
+  const homeAbbrev = NBA_ABBREV[homeLast] || NBA_ABBREV[homeTeam.toLowerCase().split(' ').slice(1).join(' ')] || null;
+  const awayAbbrev = NBA_ABBREV[awayLast] || NBA_ABBREV[awayTeam.toLowerCase().split(' ').slice(1).join(' ')] || null;
   
   for (const date of searchDates) {
-    // Try by team name parts
-    const homeWords = homeTeam.split(' ').filter(w => w.length > 3);
-    const awayWords = awayTeam.split(' ').filter(w => w.length > 3);
-    
-    // Try each word from team names
-    for (const homeWord of homeWords) {
-      const key = `${homeWord}-${date}`;
-      const match = polyLookup.byTeamDate[key];
-      
-      if (match) {
-        // Verify the match includes the other team too
-        const matchStr = (match.slug + ' ' + (match.outcomes || []).join(' ')).toLowerCase();
-        const hasAway = awayWords.some(w => matchStr.includes(w));
-        
-        if (hasAway) {
-          return match;
-        }
+    // Strategy 1: Match by team mascot/nickname + date (most reliable)
+    // e.g. "pacers-2026-02-04" -> lookup
+    const homeKey = `${homeLast}-${date}`;
+    const homeMatch = polyLookup.byTeamDate[homeKey];
+    if (homeMatch) {
+      // Verify the other team is also in this market
+      const matchStr = (homeMatch.slug + ' ' + (homeMatch.outcomes || []).join(' ') + ' ' + (homeMatch.eventTitle || '')).toLowerCase();
+      if (matchStr.includes(awayLast)) {
+        console.log(`MATCHED by mascot: ${awayTeam} @ ${homeTeam} → ${homeMatch.slug}`);
+        return homeMatch;
       }
     }
     
-    // Try normalized team names
-    for (const homeWord of homeWords) {
-      for (const awayWord of awayWords) {
-        // Try both orderings
-        const key1 = `${awayWord}-${homeWord}-${date}`;
-        const key2 = `${homeWord}-${awayWord}-${date}`;
-        
-        if (polyLookup.byTeamDate[key1]) return polyLookup.byTeamDate[key1];
-        if (polyLookup.byTeamDate[key2]) return polyLookup.byTeamDate[key2];
+    // Strategy 2: Match by NBA abbreviation in slug
+    if (homeAbbrev && awayAbbrev) {
+      // Try both orderings: away-home and home-away
+      const key1 = `${awayAbbrev}-${homeAbbrev}-${date}`;
+      const key2 = `${homeAbbrev}-${awayAbbrev}-${date}`;
+      if (polyLookup.byTeamDate[key1]) {
+        console.log(`MATCHED by abbrev: ${awayTeam} @ ${homeTeam} → ${polyLookup.byTeamDate[key1].slug}`);
+        return polyLookup.byTeamDate[key1];
+      }
+      if (polyLookup.byTeamDate[key2]) {
+        console.log(`MATCHED by abbrev: ${awayTeam} @ ${homeTeam} → ${polyLookup.byTeamDate[key2].slug}`);
+        return polyLookup.byTeamDate[key2];
+      }
+    }
+    
+    // Strategy 3: Match by full team name concatenated
+    const homeClean = homeTeam.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const awayClean = awayTeam.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (polyLookup.byTeamDate[`${homeClean}-${date}`]) {
+      console.log(`MATCHED by fullname: ${awayTeam} @ ${homeTeam} → slug`);
+      return polyLookup.byTeamDate[`${homeClean}-${date}`];
+    }
+    if (polyLookup.byTeamDate[`${awayClean}-${date}`]) {
+      return polyLookup.byTeamDate[`${awayClean}-${date}`];
+    }
+    
+    // Strategy 4: Scan all slugs for this date looking for both team indicators
+    for (const [slug, market] of Object.entries(polyLookup.bySlug)) {
+      if (!slug.includes(date)) continue;
+      
+      const matchStr = slug + ' ' + (market.outcomes || []).join(' ').toLowerCase() + ' ' + (market.eventTitle || '').toLowerCase();
+      
+      // Check if both teams are represented
+      const hasHome = matchStr.includes(homeLast) || (homeAbbrev && slug.includes(homeAbbrev));
+      const hasAway = matchStr.includes(awayLast) || (awayAbbrev && slug.includes(awayAbbrev));
+      
+      if (hasHome && hasAway) {
+        console.log(`MATCHED by scan: ${awayTeam} @ ${homeTeam} → ${slug}`);
+        return market;
       }
     }
   }
   
+  console.log(`NO MATCH: ${awayTeam} @ ${homeTeam} (${gameDate})`);
   return null;
 }
 
 /**
+ * Score how well an outcome string matches a team name (0 = no match, higher = better)
+ * Uses word-level matching with bonus for distinctive words (city, school, mascot)
+ * This handles same-mascot teams like "VCU Rams" vs "Fordham Rams"
+ */
+function teamMatchScore(outcome, teamName) {
+  // Normalize common abbreviations before scoring
+  const normalize = (s) => s
+    .replace(/\bst\b/g, 'state')
+    .replace(/\bn'western\b/g, 'northwestern')
+    .replace(/\bsf\b/g, 'san francisco')
+    .replace(/\bsfa\b/g, 'stephen f austin');
+  
+  outcome = normalize(outcome);
+  teamName = normalize(teamName);
+  
+  const outcomeWords = outcome.split(/[\s.]+/).filter(w => w.length > 1);
+  const teamWords = teamName.split(/[\s.]+/).filter(w => w.length > 1);
+  
+  if (outcomeWords.length === 0 || teamWords.length === 0) return 0;
+  
+  let score = 0;
+  let matchedWords = 0;
+  
+  for (const ow of outcomeWords) {
+    for (const tw of teamWords) {
+      if (ow === tw) {
+        // Exact word match
+        score += 10;
+        matchedWords++;
+      } else if (ow.length > 3 && tw.length > 3 && (ow.includes(tw) || tw.includes(ow))) {
+        // Partial word match (e.g. "northwestern" contains "western")
+        score += 5;
+        matchedWords++;
+      }
+    }
+  }
+  
+  // Bonus for matching the FULL outcome (all words matched)
+  if (matchedWords >= outcomeWords.length && outcomeWords.length > 1) {
+    score += 20;
+  }
+  
+  // Bonus for exact substring match (e.g. outcome "VCU Rams" is in "VCU Rams")
+  if (teamName.includes(outcome) || outcome.includes(teamName)) {
+    score += 50;
+  }
+  
+  return score;
+}
+
+/**
  * Check if outcome string matches team name
+ * Must match on the DISTINCTIVE part (mascot/nickname), not just shared city/state names
+ * e.g. "Tennessee Tech Golden Eagles" vs "Tennessee State Tigers" - shared "Tennessee" should NOT match
  */
 function isTeamMatch(outcome, teamName) {
-  const outcomeWords = outcome.split(' ').filter(w => w.length > 3);
-  const teamWords = teamName.split(' ').filter(w => w.length > 3);
+  const outcomeWords = outcome.split(/[\s.]+/).filter(w => w.length > 2);
+  const teamWords = teamName.split(/[\s.]+/).filter(w => w.length > 2);
   
-  return teamWords.some(tw => 
-    outcomeWords.some(ow => ow.includes(tw) || tw.includes(ow))
+  if (outcomeWords.length === 0 || teamWords.length === 0) return false;
+  
+  // The most reliable identifier is the LAST word (mascot/nickname)
+  // e.g. "eagles", "tigers", "rockets", "lakers"
+  const outcomeLast = outcomeWords[outcomeWords.length - 1];
+  const teamLast = teamWords[teamWords.length - 1];
+  
+  // If last words match, it's almost certainly the same team
+  if (outcomeLast === teamLast || outcomeLast.includes(teamLast) || teamLast.includes(outcomeLast)) {
+    return true;
+  }
+  
+  // For short outcome names (1-2 words like "Eagles" or "Golden Eagles"),
+  // check if the outcome IS the mascot portion of the team name
+  if (outcomeWords.length <= 2) {
+    // The outcome should match the END of the team name (the mascot part)
+    const teamMascot = teamWords.slice(-outcomeWords.length).join(' ');
+    const outcomeStr = outcomeWords.join(' ');
+    if (outcomeStr === teamMascot) return true;
+  }
+  
+  // For full team names, require at least 2 distinctive words to match
+  // This prevents "tennessee" alone from matching
+  const matchingWords = outcomeWords.filter(ow => 
+    teamWords.some(tw => ow === tw || (ow.length > 4 && (ow.includes(tw) || tw.includes(ow))))
   );
+  
+  // Need majority of the shorter name's words to match
+  const minWords = Math.min(outcomeWords.length, teamWords.length);
+  return matchingWords.length >= Math.max(2, Math.ceil(minWords * 0.6));
 }
 
 // ============================================================

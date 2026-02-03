@@ -21,6 +21,119 @@ const CONFIG = {
 };
 
 // ============================================================
+// FACTOR-BASED FILTERING (AI LEARNED)
+// ============================================================
+
+// Factors to auto-hide (historically terrible performance)
+const FADE_FACTORS = ['sports-mma'];  // 0% win rate
+
+// Factors to heavily penalize
+const WEAK_FACTORS = ['vol_100k_plus', 'freshWhale10k', 'whaleSize25k', 'vol_25k_50k', 'betVeryEarly'];  // <20% WR
+
+// Factors to boost (proven winners)
+const STRONG_FACTORS = ['volumeHuge', 'sports-other', 'freshWhale5k', 'betLast2Hours', 'betDuringEvent'];  // likely high WR
+
+// Calculate AI-adjusted score based on factor performance
+async function calculateAIScore(env, baseScore, scoreBreakdown, marketType, hasWinningWallet) {
+  if (!env.SIGNALS_CACHE) return { aiScore: baseScore, multiplier: 1.0, shouldHide: false };
+  
+  try {
+    const factorStats = await env.SIGNALS_CACHE.get('factor_stats_v2', { type: 'json' }) || {};
+    
+    let multiplier = 1.0;
+    let shouldHide = false;
+    let boostReasons = [];
+    let penaltyReasons = [];
+    
+    // Check each factor in the signal
+    const factors = scoreBreakdown?.map(f => f.factor) || [];
+    if (marketType) factors.push(marketType);
+    if (hasWinningWallet) factors.push('winningWallet');
+    
+    for (const factor of factors) {
+      const stats = factorStats[factor];
+      
+      // Skip factors with insufficient data
+      if (!stats || (stats.wins + stats.losses) < 5) continue;
+      
+      const winRate = stats.winRate;
+      const sampleSize = stats.wins + stats.losses;
+      
+      // Confidence factor: more samples = more weight
+      const confidenceFactor = Math.min(1, sampleSize / 20);
+      
+      if (winRate >= 70) {
+        // Strong factor: boost significantly
+        const boost = 1 + (0.3 * confidenceFactor);
+        multiplier *= boost;
+        boostReasons.push(`${factor}(${winRate}%)`);
+      } else if (winRate >= 55) {
+        // Good factor: small boost
+        multiplier *= (1 + (0.1 * confidenceFactor));
+      } else if (winRate <= 15) {
+        // Terrible factor: heavy penalty
+        multiplier *= (0.4 * confidenceFactor + (1 - confidenceFactor));
+        penaltyReasons.push(`${factor}(${winRate}%)`);
+        
+        // Auto-hide if dominated by terrible factors
+        if (FADE_FACTORS.includes(factor)) {
+          shouldHide = true;
+        }
+      } else if (winRate <= 25) {
+        // Weak factor: moderate penalty
+        multiplier *= (0.6 * confidenceFactor + (1 - confidenceFactor));
+        penaltyReasons.push(`${factor}(${winRate}%)`);
+      } else if (winRate <= 35) {
+        // Below average: small penalty
+        multiplier *= (0.8 * confidenceFactor + (1 - confidenceFactor));
+      }
+    }
+    
+    // Cap multiplier range
+    multiplier = Math.max(0.3, Math.min(2.0, multiplier));
+    
+    // Override: Never hide signals with winning wallets
+    if (hasWinningWallet) {
+      shouldHide = false;
+      multiplier = Math.max(multiplier, 1.0);  // At least 1.0x with winning wallet
+    }
+    
+    const aiScore = Math.round(baseScore * multiplier);
+    
+    return {
+      aiScore,
+      multiplier: Math.round(multiplier * 100) / 100,
+      shouldHide,
+      boostReasons,
+      penaltyReasons
+    };
+  } catch (e) {
+    console.error('Error calculating AI score:', e.message);
+    return { aiScore: baseScore, multiplier: 1.0, shouldHide: false };
+  }
+}
+
+// Get historical win rate for a specific factor
+async function getFactorWinRate(env, factorName) {
+  if (!env.SIGNALS_CACHE) return null;
+  
+  try {
+    const factorStats = await env.SIGNALS_CACHE.get('factor_stats_v2', { type: 'json' }) || {};
+    const stats = factorStats[factorName];
+    
+    if (!stats || (stats.wins + stats.losses) < 3) return null;
+    
+    return {
+      winRate: stats.winRate,
+      record: `${stats.wins}W-${stats.losses}L`,
+      weight: stats.weight || 1.0
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// ============================================================
 // SCAN RESULT CACHE
 // ============================================================
 async function getCachedScanResult(env, cacheKey) {
@@ -145,6 +258,12 @@ async function storeSignalForSettlement(env, signal) {
       scoreBreakdown: signal.scoreBreakdown || [],
       wallets: signal.topTrades?.map(t => t.wallet).filter(Boolean) || [],
       hasWinningWallet: signal.hasWinningWallet || false,
+      // FIX #3: Track actual bet count (trade count that contributed to this signal)
+      betCount: signal.tradeCount || signal.topTrades?.length || 0,
+      uniqueWallets: signal.uniqueWallets || 0,
+      // FIX #5: Store timing metadata for learning
+      firstTradeTime: signal.firstTradeTime || null,
+      lastTradeTime: signal.lastTradeTime || null,
       outcome: null,
       settledAt: null
     };
@@ -181,6 +300,7 @@ async function trackWalletIfWorthy(env, wallet, tradeData, signal) {
       await trackWalletBet(env, wallet, {
         signalId: signal.id,
         market: signal.marketSlug,
+        marketTitle: signal.marketTitle,  // ADD THE READABLE TITLE
         direction: signal.direction,
         amount: tradeData.amount,
         price: tradeData.price
@@ -369,12 +489,38 @@ export async function runScan(hours, minScore, env, options = {}) {
       
       const direction = market.yesVolume > market.noVolume ? 'YES' : 'NO';
       const directionPercent = Math.round((Math.max(market.yesVolume, market.noVolume) / market.totalVolume) * 100);
-      const displayPrice = market.trades[0] ? Math.round(parseFloat(market.trades[0].price) * 100) : null;
+      
+      // FIX: displayPrice should reflect the price of what's being bet ON
+      // trade.price from Polymarket is always the YES token price
+      // If whales are buying YES, displayPrice = trade.price (their entry)
+      // If whales are buying NO, their effective entry = (1 - trade.price) on the NO side
+      // But we show the YES token price as the market price regardless
+      const rawPrice = market.trades[0] ? parseFloat(market.trades[0].price) : null;
+      let displayPrice = null;
+      if (rawPrice !== null) {
+        // Always show as the YES token price (market price for Team 1)
+        displayPrice = Math.round(rawPrice * 100);
+      }
+      
       const marketType = detectMarketType(market.title || slug, slug);
       const scoreBreakdown = getScoreBreakdown(market, displayPrice, hasWinningWallet);
       
+      // ============================================================
+      // NEW: AI-POWERED SCORING
+      // ============================================================
+      const aiResult = await calculateAIScore(env, score, scoreBreakdown, marketType, hasWinningWallet);
+      
+      // Skip signals that AI says to hide (e.g., MMA with 0% historical WR)
+      if (aiResult.shouldHide) {
+        console.log(`Hiding signal ${slug}: dominated by weak factors (${aiResult.penaltyReasons.join(', ')})`);
+        continue;
+      }
+      
+      // Use AI-adjusted score
+      const aiScore = aiResult.aiScore;
+      
       // Calculate confidence with winning wallet boost
-      let confidence = Math.round(50 + (score / 100) * 25);
+      let confidence = Math.round(50 + (aiScore / 100) * 25);
       
       // BOOST: Winning wallet adds 10-15% confidence
       if (hasWinningWallet && winningWalletInfo) {
@@ -407,7 +553,9 @@ export async function runScan(hours, minScore, env, options = {}) {
         marketSlug: slug,
         marketTitle: market.title || slug,
         icon: market.icon,
-        score,
+        score,                          // Original raw score
+        aiScore,                        // AI-adjusted score (NEW!)
+        aiMultiplier: aiResult.multiplier, // Show the multiplier (NEW!)
         confidence,
         direction,
         directionPercent,
@@ -424,7 +572,45 @@ export async function runScan(hours, minScore, env, options = {}) {
         marketType,
         scoreBreakdown,
         // Priority flag for sports
-        isSportsSignal: marketType.startsWith('sports-')
+        isSportsSignal: marketType.startsWith('sports-'),
+        // FIX: Accurate bet summary for vs-format markets
+        // Polymarket rule: YES token = Team 1 (first team in title)
+        // "Syracuse vs UNC" → YES = Syracuse, NO = UNC
+        // price from API = YES token price
+        betSummary: (() => {
+          const title = market.title || slug;
+          const vsMatch = title.match(/^(.+?)\s+vs\.?\s+(.+)$/i);
+          if (vsMatch) {
+            const team1 = vsMatch[1].trim(); // YES token = Team 1
+            const team2 = vsMatch[2].trim(); // NO token = Team 2
+            if (direction === 'YES') {
+              // Whales buying YES = betting on Team 1
+              const entryPct = displayPrice ? `${displayPrice}%` : '';
+              return `${team1} (YES) @ ${entryPct}`;
+            } else {
+              // Whales buying NO = betting on Team 2
+              const entryPct = displayPrice ? `${100 - displayPrice}%` : '';
+              return `${team2} (NO) @ ${entryPct}`;
+            }
+          }
+          return null; // Let frontend handle non-vs formats
+        })(),
+        // NEW: Send team names separately for frontend flexibility
+        teamInfo: (() => {
+          const title = market.title || slug;
+          const vsMatch = title.match(/^(.+?)\s+vs\.?\s+(.+)$/i);
+          if (vsMatch) {
+            return {
+              team1: vsMatch[1].trim(),    // YES token team
+              team2: vsMatch[2].trim(),    // NO token team
+              yesTeam: vsMatch[1].trim(),
+              noTeam: vsMatch[2].trim(),
+              yesPct: displayPrice,
+              noPct: displayPrice ? (100 - displayPrice) : null
+            };
+          }
+          return null;
+        })()
       };
       
       allSignals.push(signal);
@@ -552,11 +738,38 @@ function getScoreBreakdown(market, displayPrice = 50, hasWinningWallet = false) 
   else if (market.totalVolume >= 10000) breakdown.push({ factor: 'vol_10k_25k', points: 10 });
   else breakdown.push({ factor: 'vol_under_10k', points: 5 });
   
-  // Odds factors
+  // === IMPROVEMENT #4: Split odds into DIRECTIONAL factors ===
+  // Instead of one "extremeOdds" bucket, track buying cheap longshots vs expensive favorites separately
   const price = displayPrice || 50;
-  if (price <= 15 || price >= 85) breakdown.push({ factor: 'extremeOdds', points: 35 });
-  else if (price <= 25) breakdown.push({ factor: 'moderateLongshot', points: 15 });
-  else if (price >= 75) breakdown.push({ factor: 'moderateFavorite', points: 10 });
+  const direction = market.yesVolume > market.noVolume ? 'YES' : 'NO';
+  // effectivePrice = the price the whales are BUYING at
+  // If direction=YES, they buy at displayPrice. If direction=NO, they buy at (100-displayPrice)
+  const effectivePrice = direction === 'YES' ? price : (100 - price);
+  
+  if (effectivePrice <= 15) {
+    breakdown.push({ factor: 'buyDeepLongshot', points: 35, desc: 'Buying at <15% (deep longshot)' });
+  } else if (effectivePrice <= 25) {
+    breakdown.push({ factor: 'buyLongshot', points: 20, desc: 'Buying at 15-25% (longshot)' });
+  } else if (effectivePrice <= 40) {
+    breakdown.push({ factor: 'buyUnderdog', points: 10, desc: 'Buying at 25-40% (underdog)' });
+  } else if (effectivePrice >= 85) {
+    breakdown.push({ factor: 'buyHeavyFavorite', points: 10, desc: 'Buying at 85%+ (heavy favorite)' });
+  } else if (effectivePrice >= 70) {
+    breakdown.push({ factor: 'buyFavorite', points: 8, desc: 'Buying at 70-85% (favorite)' });
+  }
+  // 40-70% range = no odds factor (fair price territory)
+  
+  // Keep legacy extremeOdds for backwards compat with existing stats (but lower points)
+  if (price <= 15 || price >= 85) breakdown.push({ factor: 'extremeOdds', points: 5 });
+  
+  // === IMPROVEMENT #5: Time-to-event factors ===
+  // How close to event start was the bet placed?
+  if (market.slug) {
+    const eventTiming = getEventTiming(market.slug, market.lastTradeTime);
+    if (eventTiming) {
+      breakdown.push(eventTiming);
+    }
+  }
   
   // WINNING WALLET FACTOR (high value!)
   if (hasWinningWallet) {
@@ -564,6 +777,54 @@ function getScoreBreakdown(market, displayPrice = 50, hasWinningWallet = false) 
   }
   
   return breakdown;
+}
+
+/**
+ * IMPROVEMENT #5: Calculate time-to-event and return a timing factor
+ * Bets placed close to game time are much more likely to be informed
+ */
+function getEventTiming(slug, lastTradeTime) {
+  // Extract event date from slug (e.g., "nba-bos-lal-2026-02-03")
+  const dateMatch = (slug || '').match(/(\d{4})-(\d{2})-(\d{2})/);
+  if (!dateMatch) return null;
+  
+  const eventDate = new Date(
+    parseInt(dateMatch[1]),
+    parseInt(dateMatch[2]) - 1,
+    parseInt(dateMatch[3])
+  );
+  
+  // Estimate event start time based on sport
+  // Most games start evening ET (7-10pm), so estimate 00:00-03:00 UTC next day
+  // For afternoon games, ~5pm ET = 22:00 UTC
+  // We'll use midnight UTC as a rough event start for the game date
+  const estimatedEventStart = new Date(eventDate);
+  estimatedEventStart.setUTCHours(24, 0, 0, 0); // End of event date UTC ≈ evening ET
+  
+  const tradeTime = typeof lastTradeTime === 'number' ? lastTradeTime : new Date(lastTradeTime).getTime();
+  if (!tradeTime || isNaN(tradeTime)) return null;
+  
+  const hoursBeforeEvent = (estimatedEventStart.getTime() - tradeTime) / (1000 * 60 * 60);
+  
+  if (hoursBeforeEvent <= 0) {
+    // Bet placed DURING or AFTER event (live betting / in-game)
+    return { factor: 'betDuringEvent', points: 20, desc: 'Bet placed during/after event start' };
+  } else if (hoursBeforeEvent <= 2) {
+    // Within 2 hours of event start — very late money
+    return { factor: 'betLast2Hours', points: 25, desc: 'Bet placed within 2h of event' };
+  } else if (hoursBeforeEvent <= 6) {
+    // Same day, close to game time
+    return { factor: 'betSameDay', points: 15, desc: 'Bet placed same day (2-6h before)' };
+  } else if (hoursBeforeEvent <= 24) {
+    // Day before
+    return { factor: 'betDayBefore', points: 8, desc: 'Bet placed day before event' };
+  } else if (hoursBeforeEvent <= 72) {
+    // 1-3 days before
+    return { factor: 'betEarlyDays', points: 5, desc: 'Bet placed 1-3 days before event' };
+  } else {
+    // Very early bet (3+ days)
+    return { factor: 'betVeryEarly', points: 3, desc: 'Bet placed 3+ days before event' };
+  }
 }
 
 // ============================================================

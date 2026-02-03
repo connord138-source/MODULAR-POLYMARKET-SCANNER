@@ -232,4 +232,4 @@ export const corsHeaders = {
 };
 
 // Version
-export const VERSION = "18.9.2 - Debug: Trade filtering diagnostics";
+export const VERSION = "18.12.0 - Directional odds + event timing + bet tracking";
