@@ -77,6 +77,7 @@ export async function pollAndStoreTrades(env) {
         eventSlug: trade.eventSlug,
         title: trade.title,
         outcome: trade.outcome,
+        outcomeIndex: trade.outcomeIndex,  // 0 = Yes/Team1, 1 = No/Team2
         side: trade.side,
         price: trade.price,
         size: trade.size,

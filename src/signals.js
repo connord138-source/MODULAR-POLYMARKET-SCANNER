@@ -418,10 +418,12 @@ export async function runScan(hours, minScore, env, options = {}) {
           wallets: new Set(),
           totalVolume: 0,
           largestBet: 0,
+          largestBetOutcome: null,
           firstTradeTime: tradeTime,
           lastTradeTime: tradeTime,
           yesVolume: 0,
-          noVolume: 0
+          noVolume: 0,
+          outcomeVolumes: {}  // Track volume per outcome name (e.g., {"Panthers": 9003, "Bruins": 441})
         });
       }
       
@@ -434,22 +436,56 @@ export async function runScan(hours, minScore, env, options = {}) {
           _tradeTime: tradeTime,
           price: t.price,
           outcome: t.outcome,
+          outcomeIndex: t.outcomeIndex,  // 0 = Yes/Team1, 1 = No/Team2
+          side: t.side,                   // BUY or SELL
           proxyWallet: t.proxyWallet
         });
       }
       
       market.totalVolume += usdValue;
-      market.largestBet = Math.max(market.largestBet, usdValue);
+      if (usdValue > market.largestBet) {
+        market.largestBet = usdValue;
+        market.largestBetOutcome = t.outcome || null;  // Track which outcome the biggest bet was on
+      }
       market.firstTradeTime = Math.min(market.firstTradeTime, tradeTime);
       market.lastTradeTime = Math.max(market.lastTradeTime, tradeTime);
       
       const wallet = extractWallet(t);
       if (wallet) market.wallets.add(wallet);
       
-      if (isNoBetOutcome(t.outcome)) {
-        market.noVolume += usdValue;
+      // Track volume per outcome - map Yes/No to team names for vs-format markets
+      const outcomeName = t.outcome ? String(t.outcome) : '';
+      const outcomeLower = outcomeName.toLowerCase();
+      const isYesNo = outcomeLower === 'yes' || outcomeLower === 'no' || outcomeLower === 'true' || outcomeLower === 'false';
+      
+      if (isYesNo) {
+        // Polymarket Data API returns "Yes"/"No" even for sports markets
+        // Map to team names using the title: "Team1 vs Team2" → Yes=Team1, No=Team2
+        const titleStr = market.title || t.title || '';
+        const vsMatch = titleStr.match(/^(.+?)\s+vs\.?\s+(.+)$/i);
+        if (vsMatch) {
+          // Sports market: map Yes/No to team names
+          const team1 = vsMatch[1].trim();
+          const team2 = vsMatch[2].trim();
+          const isTeam1 = outcomeLower === 'yes' || outcomeLower === 'true';
+          const teamName = isTeam1 ? team1 : team2;
+          market.outcomeVolumes[teamName] = (market.outcomeVolumes[teamName] || 0) + usdValue;
+        }
+        // Track YES/NO volume using outcomeIndex (more reliable) or outcome string
+        const isNo = t.outcomeIndex === 1 || outcomeLower === 'no' || outcomeLower === 'false';
+        if (isNo) {
+          market.noVolume += usdValue;
+        } else {
+          market.yesVolume += usdValue;
+        }
       } else {
-        market.yesVolume += usdValue;
+        // Non-Yes/No outcome (could be team name directly in some cases)
+        market.outcomeVolumes[outcomeName] = (market.outcomeVolumes[outcomeName] || 0) + usdValue;
+        if (isNoBetOutcome(t.outcome)) {
+          market.noVolume += usdValue;
+        } else {
+          market.yesVolume += usdValue;
+        }
       }
     }
     
@@ -487,6 +523,8 @@ export async function runScan(hours, minScore, env, options = {}) {
           price: t.price,
           time: new Date(t._tradeTime).toISOString(),
           outcome: t.outcome,
+          outcomeIndex: t.outcomeIndex,  // 0=Yes/Team1, 1=No/Team2
+          side: t.side,                   // BUY or SELL
           isWinner: walletCheck.isWinner,
           winnerInfo: walletCheck.isWinner ? walletCheck : null
         });
@@ -495,17 +533,30 @@ export async function runScan(hours, minScore, env, options = {}) {
       const direction = market.yesVolume > market.noVolume ? 'YES' : 'NO';
       const directionPercent = Math.round((Math.max(market.yesVolume, market.noVolume) / market.totalVolume) * 100);
       
-      // FIX: displayPrice should reflect the price of what's being bet ON
-      // trade.price from Polymarket is always the YES token price
-      // If whales are buying YES, displayPrice = trade.price (their entry)
-      // If whales are buying NO, their effective entry = (1 - trade.price) on the NO side
-      // But we show the YES token price as the market price regardless
+      // Determine the DOMINANT outcome (which team/side the whales are actually betting on)
+      // For sports markets, outcome is the team name (e.g., "Panthers"), not "Yes"/"No"
+      const outcomeNames = Object.keys(market.outcomeVolumes);
+      let dominantOutcome = null;
+      let dominantOutcomeVolume = 0;
+      for (const [name, vol] of Object.entries(market.outcomeVolumes)) {
+        if (vol > dominantOutcomeVolume) {
+          dominantOutcome = name;
+          dominantOutcomeVolume = vol;
+        }
+      }
+      
+      // displayPrice = the entry price of the largest trade's outcome
+      // trade.price on Polymarket = the price of THAT trade's outcome token
+      // So if whale bought "Panthers" at price 0.56, displayPrice = 56 (Panthers' price)
       const rawPrice = market.trades[0] ? parseFloat(market.trades[0].price) : null;
       let displayPrice = null;
       if (rawPrice !== null) {
-        // Always show as the YES token price (market price for Team 1)
         displayPrice = Math.round(rawPrice * 100);
       }
+      
+      // For logging: which outcome did the biggest trade buy?
+      const biggestTradeOutcome = market.trades[0]?.outcome || null;
+      console.log(`Signal ${slug}: dominantOutcome=${dominantOutcome} (${dominantOutcomeVolume}), biggestTradeOutcome=${biggestTradeOutcome}, displayPrice=${displayPrice}, outcomeVolumes=${JSON.stringify(market.outcomeVolumes)}`);
       
       const marketType = detectMarketType(market.title || slug, slug);
       const scoreBreakdown = getScoreBreakdown(market, displayPrice, hasWinningWallet);
@@ -556,6 +607,7 @@ export async function runScan(hours, minScore, env, options = {}) {
       const signal = {
         id: generateId(),
         marketSlug: slug,
+        eventSlug: market.eventSlug || slug,  // Parent event slug for correct Polymarket URLs
         marketTitle: market.title || slug,
         icon: market.icon,
         score,                          // Original raw score
@@ -579,37 +631,104 @@ export async function runScan(hours, minScore, env, options = {}) {
         // Priority flag for sports
         isSportsSignal: marketType.startsWith('sports-'),
         // FIX: Accurate bet summary for vs-format markets
-        // Polymarket rule: YES token = Team 1 (first team in title)
-        // "Syracuse vs UNC" → YES = Syracuse, NO = UNC
-        // price from API = YES token price
+        // Use the ACTUAL outcome from trades, not the YES/NO direction guess
+        // Polymarket sports trades have outcome = team name (e.g., "Panthers")
         betSummary: (() => {
           const title = market.title || slug;
           const vsMatch = title.match(/^(.+?)\s+vs\.?\s+(.+)$/i);
           if (vsMatch) {
             const team1 = vsMatch[1].trim(); // YES token = Team 1
             const team2 = vsMatch[2].trim(); // NO token = Team 2
-            if (direction === 'YES') {
-              // Whales buying YES = betting on Team 1
-              const entryPct = displayPrice ? `${displayPrice}%` : '';
-              return `${team1} (YES) @ ${entryPct}`;
-            } else {
-              // Whales buying NO = betting on Team 2
-              const entryPct = displayPrice ? `${100 - displayPrice}%` : '';
-              return `${team2} (NO) @ ${entryPct}`;
+            
+            // Determine which team the whales bet on using multiple signals:
+            // 1. dominantOutcome from outcomeVolumes (now mapped to team names)
+            // 2. Biggest trade's outcomeIndex (0=Team1, 1=Team2)
+            // 3. Biggest trade's outcome mapped via Yes/No → team
+            
+            let whaleTeam = null;
+            
+            // BEST: Use dominantOutcome (volume-weighted, now has team names)
+            if (dominantOutcome) {
+              const domLower = dominantOutcome.toLowerCase();
+              const t1Lower = team1.toLowerCase();
+              const t2Lower = team2.toLowerCase();
+              if (domLower === t1Lower || t1Lower.includes(domLower) || domLower.includes(t1Lower)) {
+                whaleTeam = team1;
+              } else if (domLower === t2Lower || t2Lower.includes(domLower) || domLower.includes(t2Lower)) {
+                whaleTeam = team2;
+              }
             }
+            
+            // FALLBACK: Use biggest trade's outcome + outcomeIndex
+            if (!whaleTeam && market.trades[0]) {
+              const bigTrade = market.trades[0];
+              const outLower = (bigTrade.outcome || '').toLowerCase();
+              
+              if (bigTrade.outcomeIndex === 0 || outLower === 'yes' || outLower === 'true') {
+                whaleTeam = team1;
+              } else if (bigTrade.outcomeIndex === 1 || outLower === 'no' || outLower === 'false') {
+                whaleTeam = team2;
+              } else {
+                // Outcome might be a team name directly (some markets)
+                const t1Lower = team1.toLowerCase();
+                const t2Lower = team2.toLowerCase();
+                if (t1Lower.includes(outLower) || outLower.includes(t1Lower)) {
+                  whaleTeam = team1;
+                } else if (t2Lower.includes(outLower) || outLower.includes(t2Lower)) {
+                  whaleTeam = team2;
+                }
+              }
+            }
+            
+            // LAST RESORT: use volume direction
+            if (!whaleTeam) {
+              whaleTeam = market.yesVolume >= market.noVolume ? team1 : team2;
+            }
+            
+            // displayPrice = price of the outcome token the whale bought
+            const entryPct = displayPrice ? `${displayPrice}%` : '';
+            console.log(`betSummary: title="${title}" whaleTeam="${whaleTeam}" dominantOutcome="${dominantOutcome}" biggestTrade=${biggestTradeOutcome}(idx:${market.trades[0]?.outcomeIndex}) displayPrice=${displayPrice}`);
+            return `${whaleTeam} @ ${entryPct}`;
           }
-          return null; // Let frontend handle non-vs formats
+          return null;
         })(),
         // NEW: Send team names separately for frontend flexibility
         teamInfo: (() => {
           const title = market.title || slug;
           const vsMatch = title.match(/^(.+?)\s+vs\.?\s+(.+)$/i);
           if (vsMatch) {
+            const team1 = vsMatch[1].trim();
+            const team2 = vsMatch[2].trim();
+            
+            // Determine which team whales are betting on
+            // Use same logic as betSummary: dominantOutcome (team names from outcomeVolumes)
+            // or outcomeIndex from biggest trade
+            let whaleTeam = team1; // default to team1
+            
+            // Use dominantOutcome (now properly mapped to team names)
+            if (dominantOutcome) {
+              const domLower = dominantOutcome.toLowerCase();
+              const t2Lower = team2.toLowerCase();
+              if (domLower === t2Lower || t2Lower.includes(domLower) || domLower.includes(t2Lower)) {
+                whaleTeam = team2;
+              }
+            } else if (market.trades[0]) {
+              // Fallback: use biggest trade's outcomeIndex
+              const bigTrade = market.trades[0];
+              const outLower = (bigTrade.outcome || '').toLowerCase();
+              if (bigTrade.outcomeIndex === 1 || outLower === 'no' || outLower === 'false') {
+                whaleTeam = team2;
+              }
+            }
+            
             return {
-              team1: vsMatch[1].trim(),    // YES token team
-              team2: vsMatch[2].trim(),    // NO token team
-              yesTeam: vsMatch[1].trim(),
-              noTeam: vsMatch[2].trim(),
+              team1,
+              team2,
+              yesTeam: team1,
+              noTeam: team2,
+              whaleTeam,
+              whaleOutcome: dominantOutcome || biggestTradeOutcome || null,
+              whalePrice: displayPrice,
               yesPct: displayPrice,
               noPct: displayPrice ? (100 - displayPrice) : null
             };
