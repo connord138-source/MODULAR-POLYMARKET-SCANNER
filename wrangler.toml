@@ -12,7 +12,7 @@ id = "591fb82d52b14b408378eeee28bd3a25"
 
 # Cron triggers for automatic settlement
 [triggers]
-crons = ["*/5 * * * *"]  # Every 5 minutes
+crons = ["*/1 * * * *"]  # Every 1 minute
 
 # Environment variables (secrets should be set via wrangler secret put)
 # ODDS_API_KEY - Set via: npx wrangler secret put ODDS_API_KEY
