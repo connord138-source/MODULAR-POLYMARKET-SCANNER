@@ -232,4 +232,4 @@ export const corsHeaders = {
 };
 
 // Version
-export const VERSION = "18.12.0 - Directional odds + event timing + bet tracking";
+export const VERSION = "18.13.0 - Debug endpoints + KV trade accumulation fix for large bets";

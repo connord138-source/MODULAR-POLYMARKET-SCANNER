@@ -8,6 +8,7 @@ import { detectMarketType, generateId, isSportsGame } from './utils.js';
 import { trackWalletBet } from './wallets.js';
 import { calculateConfidence } from './learning.js';
 import { batchGetEventTiming } from './polymarket-api.js';
+import { getAccumulatedTrades } from './trades.js';
 
 // ============================================================
 // CONFIGURATION
@@ -337,21 +338,74 @@ export async function runScan(hours, minScore, env, options = {}) {
     const winningWallets = await getWinningWallets(env);
     console.log(`Loaded ${winningWallets.size} winning wallets from cache`);
     
-    // Fetch trades from API (skip KV buckets to save memory)
+    // IMPROVED: Try KV accumulated trades FIRST (they have better historical coverage)
+    // Then supplement with fresh API call for the newest trades
+    let allTrades = [];
+    let tradesSource = 'api';
+    
+    // Step 1: Get accumulated trades from KV (catches trades from past polling cycles)
+    try {
+      const { trades: kvTrades, fromKV, totalTrades: kvTotal } = await getAccumulatedTrades(env, hours);
+      if (fromKV && kvTrades.length > 0) {
+        allTrades = kvTrades;
+        tradesSource = 'kv';
+        console.log(`Loaded ${kvTrades.length} trades from KV buckets`);
+        
+        // Log any large bets found in KV
+        const largeBetsInKV = kvTrades.filter(t => (parseFloat(t.size) || 0) >= 50000);
+        if (largeBetsInKV.length > 0) {
+          console.log(`Found ${largeBetsInKV.length} large bets ($50k+) in KV:`, 
+            largeBetsInKV.slice(0, 3).map(t => `${t.title}: $${Math.round(parseFloat(t.size))}`));
+        }
+      }
+    } catch (kvErr) {
+      console.log('KV trade fetch failed, falling back to API:', kvErr.message);
+    }
+    
+    // Step 2: Always also fetch fresh from API to get newest trades
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
     
-    let allTrades = [];
     try {
       const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=${CONFIG.TRADE_LIMIT}`, {
         signal: controller.signal
       });
       if (tradesRes.ok) {
-        allTrades = await tradesRes.json();
-        console.log(`Fetched ${allTrades.length} trades from API`);
+        const apiTrades = await tradesRes.json();
+        console.log(`Fetched ${apiTrades.length} trades from API`);
+        
+        // Log any large bets found in API
+        const largeBetsInAPI = apiTrades.filter(t => {
+          const usdValue = parseFloat(t.usd_value) || parseFloat(t.usdcSize) || parseFloat(t.size) || 0;
+          return usdValue >= 50000;
+        });
+        if (largeBetsInAPI.length > 0) {
+          console.log(`Found ${largeBetsInAPI.length} large bets ($50k+) in API:`, 
+            largeBetsInAPI.slice(0, 3).map(t => `${t.title}: $${Math.round(parseFloat(t.usd_value) || parseFloat(t.size))}`));
+        }
+        
+        if (allTrades.length === 0) {
+          // No KV trades, use API only
+          allTrades = apiTrades;
+          tradesSource = 'api';
+        } else {
+          // Merge: add API trades that aren't already in KV (by timestamp + wallet + slug)
+          const kvSet = new Set(allTrades.map(t => `${t.timestamp}-${t.proxyWallet}-${t.slug || t.eventSlug}`));
+          const newFromAPI = apiTrades.filter(t => {
+            const key = `${t.timestamp}-${t.proxyWallet}-${t.slug || t.eventSlug}`;
+            return !kvSet.has(key);
+          });
+          allTrades = [...allTrades, ...newFromAPI];
+          tradesSource = 'kv+api';
+          console.log(`Merged ${newFromAPI.length} new trades from API (total: ${allTrades.length})`);
+        }
       }
     } catch (e) {
-      return { success: true, signals: [], totalSignals: 0, message: 'Trade fetch failed', processingTime: Date.now() - startTime };
+      if (allTrades.length === 0) {
+        return { success: true, signals: [], totalSignals: 0, message: 'Trade fetch failed', processingTime: Date.now() - startTime };
+      }
+      // We have KV trades, continue with those
+      console.log('API fetch failed but have KV trades, continuing');
     } finally {
       clearTimeout(timeout);
     }

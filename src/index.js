@@ -956,6 +956,194 @@ export default {
         });
       }
       
+      // ============ DEBUG ENDPOINTS ============
+      
+      // Debug: Show raw trades from API (no filtering)
+      if (path === "/debug/raw-trades") {
+        const limit = parseInt(url.searchParams.get("limit") || "100");
+        try {
+          const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=${limit}`);
+          if (!tradesRes.ok) {
+            return jsonResponse({ error: `API returned ${tradesRes.status}` }, 500);
+          }
+          const trades = await tradesRes.json();
+          
+          // Find large bets
+          const largeBets = trades.filter(t => {
+            const usdValue = parseFloat(t.usd_value) || parseFloat(t.usdcSize) || parseFloat(t.size) || 0;
+            return usdValue >= 10000;
+          }).map(t => ({
+            title: t.title || t.market,
+            amount: parseFloat(t.usd_value) || parseFloat(t.usdcSize) || parseFloat(t.size) || 0,
+            wallet: t.proxyWallet,
+            outcome: t.outcome,
+            price: t.price,
+            timestamp: t.timestamp,
+            timeAgo: Math.round((Date.now() / 1000 - t.timestamp) / 60) + ' mins ago'
+          }));
+          
+          return jsonResponse({
+            success: true,
+            totalTrades: trades.length,
+            largeBets: largeBets,
+            largeBetCount: largeBets.length,
+            oldestTradeAge: trades.length > 0 ? Math.round((Date.now() / 1000 - trades[trades.length - 1].timestamp) / 60) + ' mins' : null,
+            newestTradeAge: trades.length > 0 ? Math.round((Date.now() / 1000 - trades[0].timestamp) / 60) + ' mins' : null,
+            sampleTrade: trades[0] ? {
+              title: trades[0].title,
+              amount: parseFloat(trades[0].usd_value) || parseFloat(trades[0].usdcSize) || parseFloat(trades[0].size),
+              timestamp: trades[0].timestamp,
+              allFields: Object.keys(trades[0])
+            } : null
+          });
+        } catch (e) {
+          return jsonResponse({ error: e.message }, 500);
+        }
+      }
+      
+      // Debug: Show accumulated trades from KV
+      if (path === "/debug/kv-trades") {
+        const hours = parseInt(url.searchParams.get("hours") || "24");
+        const minAmount = parseInt(url.searchParams.get("minAmount") || "10000");
+        
+        try {
+          const { trades, fromKV, bucketsRead, totalTrades } = await getAccumulatedTrades(env, hours);
+          
+          const largeBets = trades.filter(t => {
+            const usdValue = parseFloat(t.size) || 0;
+            return usdValue >= minAmount;
+          }).map(t => ({
+            title: t.title,
+            slug: t.slug,
+            amount: parseFloat(t.size) || 0,
+            wallet: t.proxyWallet,
+            outcome: t.outcome,
+            price: t.price,
+            timestamp: t.timestamp,
+            timeAgo: Math.round((Date.now() / 1000 - t.timestamp) / 60) + ' mins ago'
+          })).sort((a, b) => b.amount - a.amount);
+          
+          return jsonResponse({
+            success: true,
+            fromKV,
+            bucketsRead,
+            totalTrades,
+            largeBets: largeBets.slice(0, 50),
+            largeBetCount: largeBets.length,
+            largestBet: largeBets[0] || null
+          });
+        } catch (e) {
+          return jsonResponse({ error: e.message }, 500);
+        }
+      }
+      
+      // Debug: Show what the scan would filter
+      if (path === "/debug/scan-filters") {
+        const hours = parseInt(url.searchParams.get("hours") || "48");
+        
+        try {
+          const tradesRes = await fetch(`${POLYMARKET_API}/trades?limit=2000`);
+          const trades = await tradesRes.json();
+          
+          const cutoffTime = Date.now() - (hours * 60 * 60 * 1000);
+          
+          const stats = {
+            total: trades.length,
+            passed: 0,
+            filtered: {
+              noTitle: 0,
+              gambling: 0,
+              tooOld: 0,
+              badPrice: 0,
+              tooSmall: 0,
+              noSlug: 0
+            },
+            largeBetsFiltered: [],
+            largeBetsPassed: []
+          };
+          
+          const GAMBLING_KEYWORDS = ['up or down', '15m', '30m', '1h', '5m'];
+          
+          for (const t of trades) {
+            const usdValue = parseFloat(t.usd_value) || parseFloat(t.usdcSize) || parseFloat(t.size) || 0;
+            const isLarge = usdValue >= 25000;
+            
+            const marketTitle = t.title || t.market || '';
+            if (!marketTitle) { 
+              stats.filtered.noTitle++; 
+              if (isLarge) stats.largeBetsFiltered.push({ reason: 'noTitle', amount: usdValue, title: marketTitle });
+              continue; 
+            }
+            
+            const isGambling = GAMBLING_KEYWORDS.some(kw => marketTitle.toLowerCase().includes(kw));
+            if (isGambling) { 
+              stats.filtered.gambling++; 
+              if (isLarge) stats.largeBetsFiltered.push({ reason: 'gambling', amount: usdValue, title: marketTitle });
+              continue; 
+            }
+            
+            let tradeTime = t.timestamp * 1000;
+            if (tradeTime < cutoffTime) { 
+              stats.filtered.tooOld++; 
+              if (isLarge) stats.largeBetsFiltered.push({ reason: 'tooOld', amount: usdValue, title: marketTitle, age: Math.round((Date.now() - tradeTime) / 3600000) + 'h' });
+              continue; 
+            }
+            
+            const price = parseFloat(t.price) || 0;
+            if (price >= 0.95 || price <= 0.05) { 
+              stats.filtered.badPrice++; 
+              if (isLarge) stats.largeBetsFiltered.push({ reason: 'badPrice', amount: usdValue, title: marketTitle, price });
+              continue; 
+            }
+            
+            if (usdValue < 10) { 
+              stats.filtered.tooSmall++; 
+              continue; 
+            }
+            
+            const slug = t.slug || t.eventSlug || '';
+            if (!slug && !marketTitle) { 
+              stats.filtered.noSlug++; 
+              if (isLarge) stats.largeBetsFiltered.push({ reason: 'noSlug', amount: usdValue, title: marketTitle });
+              continue; 
+            }
+            
+            stats.passed++;
+            if (isLarge) {
+              stats.largeBetsPassed.push({ amount: usdValue, title: marketTitle, wallet: t.proxyWallet?.slice(0, 10) + '...' });
+            }
+          }
+          
+          return jsonResponse({
+            success: true,
+            ...stats,
+            summary: `${stats.passed}/${stats.total} trades passed filters. ${stats.largeBetsPassed.length} large bets ($25k+) passed, ${stats.largeBetsFiltered.length} filtered out.`
+          });
+        } catch (e) {
+          return jsonResponse({ error: e.message }, 500);
+        }
+      }
+      
+      // Debug: Check poll status and trade accumulation health
+      if (path === "/debug/poll-health") {
+        const pollStats = await getPollStats(env);
+        const cronStats = env.SIGNALS_CACHE ? await env.SIGNALS_CACHE.get('cron_stats', { type: 'json' }) : null;
+        const lastCronRun = env.SIGNALS_CACHE ? await env.SIGNALS_CACHE.get('last_cron_run') : null;
+        
+        return jsonResponse({
+          success: true,
+          pollStats,
+          cronStats,
+          lastCronRun,
+          minutesSinceCron: lastCronRun ? Math.round((Date.now() - new Date(lastCronRun).getTime()) / 60000) : null,
+          diagnosis: {
+            cronRunning: lastCronRun && (Date.now() - new Date(lastCronRun).getTime()) < 5 * 60 * 1000,
+            tradesAccumulating: pollStats?.tradesStored > 0,
+            bucketsHealthy: pollStats?.activeBuckets > 0
+          }
+        });
+      }
+      
       // 404
       return jsonResponse({ error: "Not found", path }, 404);
       
