@@ -338,31 +338,13 @@ export async function runScan(hours, minScore, env, options = {}) {
     const winningWallets = await getWinningWallets(env);
     console.log(`Loaded ${winningWallets.size} winning wallets from cache`);
     
-    // IMPROVED: Try KV accumulated trades FIRST (they have better historical coverage)
-    // Then supplement with fresh API call for the newest trades
+    // OPTIMIZED: Fetch fresh API trades (fast, limited to ~1500)
+    // Then SEPARATELY scan KV for large bets only (to catch whales we missed)
     let allTrades = [];
     let tradesSource = 'api';
+    let kvLargeBets = [];
     
-    // Step 1: Get accumulated trades from KV (catches trades from past polling cycles)
-    try {
-      const { trades: kvTrades, fromKV, totalTrades: kvTotal } = await getAccumulatedTrades(env, hours);
-      if (fromKV && kvTrades.length > 0) {
-        allTrades = kvTrades;
-        tradesSource = 'kv';
-        console.log(`Loaded ${kvTrades.length} trades from KV buckets`);
-        
-        // Log any large bets found in KV
-        const largeBetsInKV = kvTrades.filter(t => (parseFloat(t.size) || 0) >= 50000);
-        if (largeBetsInKV.length > 0) {
-          console.log(`Found ${largeBetsInKV.length} large bets ($50k+) in KV:`, 
-            largeBetsInKV.slice(0, 3).map(t => `${t.title}: $${Math.round(parseFloat(t.size))}`));
-        }
-      }
-    } catch (kvErr) {
-      console.log('KV trade fetch failed, falling back to API:', kvErr.message);
-    }
-    
-    // Step 2: Always also fetch fresh from API to get newest trades
+    // Step 1: Fetch fresh from API (primary source - fast)
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
     
@@ -371,43 +353,59 @@ export async function runScan(hours, minScore, env, options = {}) {
         signal: controller.signal
       });
       if (tradesRes.ok) {
-        const apiTrades = await tradesRes.json();
-        console.log(`Fetched ${apiTrades.length} trades from API`);
-        
-        // Log any large bets found in API
-        const largeBetsInAPI = apiTrades.filter(t => {
-          const usdValue = parseFloat(t.usd_value) || parseFloat(t.usdcSize) || parseFloat(t.size) || 0;
-          return usdValue >= 50000;
-        });
-        if (largeBetsInAPI.length > 0) {
-          console.log(`Found ${largeBetsInAPI.length} large bets ($50k+) in API:`, 
-            largeBetsInAPI.slice(0, 3).map(t => `${t.title}: $${Math.round(parseFloat(t.usd_value) || parseFloat(t.size))}`));
-        }
-        
-        if (allTrades.length === 0) {
-          // No KV trades, use API only
-          allTrades = apiTrades;
-          tradesSource = 'api';
-        } else {
-          // Merge: add API trades that aren't already in KV (by timestamp + wallet + slug)
-          const kvSet = new Set(allTrades.map(t => `${t.timestamp}-${t.proxyWallet}-${t.slug || t.eventSlug}`));
-          const newFromAPI = apiTrades.filter(t => {
-            const key = `${t.timestamp}-${t.proxyWallet}-${t.slug || t.eventSlug}`;
-            return !kvSet.has(key);
-          });
-          allTrades = [...allTrades, ...newFromAPI];
-          tradesSource = 'kv+api';
-          console.log(`Merged ${newFromAPI.length} new trades from API (total: ${allTrades.length})`);
-        }
+        allTrades = await tradesRes.json();
+        console.log(`Fetched ${allTrades.length} trades from API`);
       }
     } catch (e) {
-      if (allTrades.length === 0) {
-        return { success: true, signals: [], totalSignals: 0, message: 'Trade fetch failed', processingTime: Date.now() - startTime };
-      }
-      // We have KV trades, continue with those
-      console.log('API fetch failed but have KV trades, continuing');
+      console.log('API fetch failed:', e.message);
     } finally {
       clearTimeout(timeout);
+    }
+    
+    // Step 2: Scan KV for LARGE BETS ONLY (>$25k) - these are what matter
+    // This is separate from main scan to avoid memory issues
+    try {
+      const { trades: kvTrades, fromKV } = await getAccumulatedTrades(env, hours);
+      if (fromKV && kvTrades.length > 0) {
+        // Only extract large bets from KV (don't load everything into main scan)
+        kvLargeBets = kvTrades.filter(t => {
+          const usdValue = parseFloat(t.size) || 0;
+          return usdValue >= 25000;
+        });
+        
+        if (kvLargeBets.length > 0) {
+          console.log(`Found ${kvLargeBets.length} large bets ($25k+) in KV`);
+          
+          // Merge large KV bets into allTrades if not already present
+          const apiSet = new Set(allTrades.map(t => `${t.timestamp}-${t.proxyWallet}`));
+          const newLargeBets = kvLargeBets.filter(t => {
+            const key = `${t.ts || t.timestamp}-${t.proxyWallet}`;
+            return !apiSet.has(key);
+          }).map(t => ({
+            // Convert KV format back to API format
+            timestamp: t.ts || t.timestamp,
+            slug: t.slug,
+            eventSlug: t.eventSlug,
+            title: t.title,
+            outcome: t.outcome,
+            outcomeIndex: t.outcomeIndex,
+            side: t.side,
+            price: t.price,
+            size: t.size,
+            usd_value: t.size,  // KV stores as 'size'
+            proxyWallet: t.proxyWallet,
+            icon: t.icon
+          }));
+          
+          if (newLargeBets.length > 0) {
+            allTrades = [...allTrades, ...newLargeBets];
+            tradesSource = 'api+kv_whales';
+            console.log(`Added ${newLargeBets.length} large bets from KV (total: ${allTrades.length})`);
+          }
+        }
+      }
+    } catch (kvErr) {
+      console.log('KV large bet scan failed:', kvErr.message);
     }
     
     if (!allTrades || allTrades.length === 0) {

@@ -232,4 +232,4 @@ export const corsHeaders = {
 };
 
 // Version
-export const VERSION = "18.13.0 - Debug endpoints + KV trade accumulation fix for large bets";
+export const VERSION = "18.13.2 - Optimized KV scan (large bets only) to avoid resource limits";
