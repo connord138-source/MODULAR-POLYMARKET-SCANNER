@@ -1,6 +1,7 @@
 // ============================================================
 // TRADES.JS - Trade Accumulation System
 // Polls Polymarket API and stores trades in KV for historical data
+// v2.1 - Added overlap buffer to guarantee no missed trades
 // ============================================================
 
 import { POLYMARKET_API } from './config.js';
@@ -40,14 +41,15 @@ export async function pollAndStoreTrades(env) {
     
     const trades = await tradesRes.json();
     
-    // Get last poll timestamp to avoid duplicates
+    // Get last poll timestamp - use 2 minute overlap to never miss trades
     const lastPollStr = await env.SIGNALS_CACHE.get(TRADES_KV_KEYS.LAST_POLL);
     const lastPollTime = lastPollStr ? parseInt(lastPollStr) : 0;
-    
-    // Filter to only new trades (after last poll)
+    const overlapBuffer = 2 * 60 * 1000; // 2 minute overlap window
+
+    // Filter trades - include overlap window (dedup handles duplicates)
     const newTrades = trades.filter(t => {
-      const tradeTime = t.timestamp * 1000; // Convert to ms
-      return tradeTime > lastPollTime;
+      const tradeTime = t.timestamp * 1000;
+      return tradeTime > (lastPollTime - overlapBuffer);
     });
     
     if (newTrades.length === 0) {
@@ -88,6 +90,8 @@ export async function pollAndStoreTrades(env) {
     
     // Store each bucket (merge with existing)
     const bucketKeys = Object.keys(buckets);
+    let totalNewStored = 0;
+    
     for (const bucketKey of bucketKeys) {
       // Get existing bucket data
       const existingData = await env.SIGNALS_CACHE.get(bucketKey, { type: 'json' }) || [];
@@ -97,6 +101,8 @@ export async function pollAndStoreTrades(env) {
       const newBucketTrades = buckets[bucketKey].filter(t => 
         !existingSet.has(`${t.ts}-${t.proxyWallet}-${t.slug}`)
       );
+      
+      totalNewStored += newBucketTrades.length;
       
       if (newBucketTrades.length > 0) {
         const mergedTrades = [...existingData, ...newBucketTrades];
@@ -141,7 +147,10 @@ export async function pollAndStoreTrades(env) {
     // Store poll stats
     const stats = {
       lastPoll: new Date().toISOString(),
-      tradesStored: newTrades.length,
+      tradesStored: totalNewStored,
+      tradesFetched: trades.length,
+      tradesInWindow: newTrades.length,
+      duplicatesSkipped: newTrades.length - totalNewStored,
       bucketsUpdated: bucketKeys.length,
       totalBuckets: activeIndex.length,
       pollDuration: Date.now() - startTime
@@ -150,7 +159,9 @@ export async function pollAndStoreTrades(env) {
     
     return {
       success: true,
-      newTrades: newTrades.length,
+      newTrades: totalNewStored,
+      tradesFetched: trades.length,
+      duplicatesSkipped: newTrades.length - totalNewStored,
       bucketsUpdated: bucketKeys.length,
       totalBuckets: activeIndex.length,
       duration: Date.now() - startTime
