@@ -3,7 +3,7 @@
 // v18.9.0 - Winning Focus: Track winners, prune losers, sports priority
 // ============================================================
 
-import { corsHeaders, VERSION, SPORT_KEY_MAP, KV_KEYS } from './config.js';
+import { corsHeaders, VERSION, SPORT_KEY_MAP, KV_KEYS, POLYMARKET_API } from './config.js';
 import { runScan, getRecentSignals, getSignal, getPendingSignalsCount, getTrackedWalletsCount } from './signals.js';
 import { getWalletStats, getWalletLeaderboard, getTrackedWallets, pruneLosingWallets, clearTradeBuckets, fullKVCleanup, deduplicateWalletBets, getWalletPnL } from './wallets.js';
 import { getOddsComparison, getGameScores, getGameOdds } from './odds-api.js';
